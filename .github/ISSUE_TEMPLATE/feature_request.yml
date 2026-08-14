@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a business-neutral runtime capability or contract change
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Runtime problem
+      description: Describe the concrete runtime limitation or integration problem.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Why this belongs in agent-go
+      description: Explain why the behavior is business-neutral and cannot remain in the host application.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior or API
+      description: Include lifecycle, failure, compatibility, and persistence semantics when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe host-side implementations or existing APIs you considered.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for related requests.
+          required: true
+        - label: The proposal does not add application handlers, storage implementations, queues, billing rules, product prompts, or domain tools.
+          required: true
