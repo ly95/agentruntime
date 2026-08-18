@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,12 +26,16 @@ func (s *recordingStore) AcquireExecution(_ context.Context, request AcquireExec
 	execution := request.Execution
 	if existing, ok := s.executions[execution.ID]; ok {
 		if existing.IdempotencyKey != execution.IdempotencyKey || existing.IdempotencyScope != execution.IdempotencyScope ||
-			existing.SessionID != execution.SessionID || existing.Name != execution.Name || !bytes.Equal(existing.Arguments, execution.Arguments) {
+			existing.SessionID != execution.SessionID || existing.Name != execution.Name || existing.ContractID != execution.ContractID ||
+			existing.VerificationRequired != execution.VerificationRequired || !bytes.Equal(existing.Arguments, execution.Arguments) {
 			return AcquireExecutionResult{}, ErrOperationPlanChanged
 		}
 		if existing.Status == OperationExecutionRetryable {
-			if existing.AttemptID == execution.AttemptID {
-				return AcquireExecutionResult{}, ErrInvalidExecutionTransition
+			if s.executionAttemptIdentityExistsLocked(execution.ID, execution.AttemptID) {
+				return AcquireExecutionResult{}, fmt.Errorf("%w: attempt id %q is already assigned to execution %q", ErrIdentityConflict, execution.AttemptID, execution.ID)
+			}
+			if s.transitionIdentityExistsLocked(request.Transition.ID) {
+				return AcquireExecutionResult{}, fmt.Errorf("%w: transition id %q is already assigned", ErrIdentityConflict, request.Transition.ID)
 			}
 			transition := cloneOperationTransitionForTest(request.Transition)
 			transition.From = OperationExecutionRetryable
@@ -52,6 +57,9 @@ func (s *recordingStore) AcquireExecution(_ context.Context, request AcquireExec
 			disposition = ExecutionReplay
 		}
 		return AcquireExecutionResult{Execution: cloneOperationExecutionRecord(existing), Disposition: disposition}, nil
+	}
+	if s.transitionIdentityExistsLocked(request.Transition.ID) {
+		return AcquireExecutionResult{}, fmt.Errorf("%w: transition id %q is already assigned", ErrIdentityConflict, request.Transition.ID)
 	}
 	execution = cloneOperationExecutionRecord(execution)
 	s.executions[execution.ID] = execution
@@ -104,8 +112,14 @@ func (s *recordingStore) TransitionExecution(_ context.Context, transition Opera
 	if execution.RunID != transition.RunID || execution.CallID != transition.CallID {
 		return OperationExecutionRecord{}, ErrInvalidExecutionTransition
 	}
+	if execution.VerificationRequired != transition.VerificationRequired {
+		return OperationExecutionRecord{}, ErrInvalidExecutionTransition
+	}
 	if transition.To == OperationExecutionStarted {
 		return OperationExecutionRecord{}, ErrInvalidExecutionTransition
+	}
+	if s.transitionIdentityExistsLocked(transition.ID) {
+		return OperationExecutionRecord{}, fmt.Errorf("%w: transition id %q is already assigned", ErrIdentityConflict, transition.ID)
 	}
 	execution.Status = transition.To
 	execution.UpdatedAt = transition.CreatedAt
@@ -113,6 +127,9 @@ func (s *recordingStore) TransitionExecution(_ context.Context, transition Opera
 	case OperationExecutionUnknown, OperationExecutionRetryable:
 		execution.Error = transition.Message
 		execution.Result = OperationResult{}
+		execution.Verification = nil
+	case OperationExecutionRecoveryFailed:
+		execution.Error = transition.Message
 		execution.Verification = nil
 	case OperationExecutionExecuted, OperationExecutionCompleted:
 		execution.Error = ""
@@ -122,6 +139,26 @@ func (s *recordingStore) TransitionExecution(_ context.Context, transition Opera
 	s.executions[execution.ID] = execution
 	s.transitions[execution.ID] = append(s.transitions[execution.ID], cloneOperationTransitionForTest(transition))
 	return cloneOperationExecutionRecord(execution), nil
+}
+
+func (s *recordingStore) transitionIdentityExistsLocked(id string) bool {
+	for _, history := range s.transitions {
+		for _, transition := range history {
+			if transition.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *recordingStore) executionAttemptIdentityExistsLocked(executionID, attemptID string) bool {
+	for _, transition := range s.transitions[executionID] {
+		if transition.AttemptID == attemptID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *recordingStore) ListExecutionTransitions(_ context.Context, executionID string) ([]OperationExecutionTransition, error) {
@@ -138,39 +175,123 @@ func (s *recordingStore) ListExecutionTransitions(_ context.Context, executionID
 	return out, nil
 }
 
-func (s *recordingStore) BeginRun(ctx context.Context, request BeginRunRequest) (BeginRunResult, error) {
+func (s *recordingStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+	return s.beginRunV3(ctx, ResumeRunRequest{
+		Run: request.Run, LeaseID: request.LeaseID, LeaseTTL: request.LeaseTTL,
+	}, false, accept, nil)
+}
+
+func (s *recordingStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+	return s.beginRunV3(ctx, request, true, nil, accept)
+}
+
+func (s *recordingStore) beginRunV3(
+	ctx context.Context,
+	request ResumeRunRequest,
+	resume bool,
+	acceptCreate AcceptRunStart,
+	acceptResume AcceptResumedRun,
+) error {
 	if err := ctx.Err(); err != nil {
-		return BeginRunResult{}, err
+		return err
+	}
+	if (!resume && acceptCreate == nil) || (resume && acceptResume == nil) {
+		return errors.New("recordingStore: pre-commit acceptance is required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := requireCanonicalIdentity(request.Run.ID, "recordingStore run id"); err != nil {
+		return err
+	}
+	for _, item := range s.items {
+		if item.ID == request.Run.ID {
+			return fmt.Errorf("%w: run id %q is already assigned to an item", ErrIdentityConflict, request.Run.ID)
+		}
+	}
 	if request.Run.Status != RunStatusRunning {
-		return BeginRunResult{}, errors.New("recordingStore: run must be running")
+		return errors.New("recordingStore: run must be running")
 	}
 	handle := RunHandle{RunID: request.Run.ID, SessionID: request.Run.SessionID}
 	runIndex := -1
+	pendingApprovalDigest := ""
+	var pendingApproval *PendingApprovalCommit
 	for i := range s.runs {
-		if s.runs[i].ID == request.Run.ID {
-			if s.runs[i].Status != RunStatusWaitingUser {
-				return BeginRunResult{}, fmt.Errorf("recordingStore: run %s cannot resume from %q", request.Run.ID, s.runs[i].Status)
-			}
-			if s.runs[i].SkillSetID != request.Run.SkillSetID {
-				return BeginRunResult{}, fmt.Errorf("%w: waiting run %s", ErrSkillSetMismatch, request.Run.ID)
-			}
-			runIndex = i
-			break
+		if s.runs[i].ID != request.Run.ID {
+			continue
 		}
+		if !resume {
+			return fmt.Errorf("%w: run id %q is already assigned", ErrIdentityConflict, request.Run.ID)
+		}
+		if s.runs[i].Status != RunStatusWaitingUser {
+			return fmt.Errorf("%w: run id %q is already assigned", ErrIdentityConflict, request.Run.ID)
+		}
+		if s.runs[i].SkillSetID != request.Run.SkillSetID {
+			return fmt.Errorf("%w: waiting run %s", ErrSkillSetMismatch, request.Run.ID)
+		}
+		if s.runs[i].OperationSetID != request.Run.OperationSetID {
+			return fmt.Errorf("%w: waiting run %s operation set", ErrOperationPlanChanged, request.Run.ID)
+		}
+		runIndex = i
+		pendingApprovalDigest = s.runs[i].PendingApprovalDigest
+		break
+	}
+	if resume && runIndex < 0 {
+		return ErrRunNotFound
+	}
+	if resume {
+		if pendingApprovalDigest == "" {
+			return fmt.Errorf("%w: waiting run %s has no durable approval authority", ErrOperationPlanChanged, request.Run.ID)
+		}
+		if err := validateApprovalAuthorityDigest(pendingApprovalDigest); err != nil {
+			return fmt.Errorf("%w: waiting run %s has invalid durable approval authority: %v", ErrOperationPlanChanged, request.Run.ID, err)
+		}
+		pending, ok := s.pendingApprovals[request.Run.ID]
+		if !ok || pending.Digest != pendingApprovalDigest {
+			return fmt.Errorf("%w: waiting run %s has no matching pending approval", ErrOperationPlanChanged, request.Run.ID)
+		}
+		if pending.Request.Checkpoint == nil || request.InputDigest == "" ||
+			request.InputDigest != pending.Request.Checkpoint.InputDigest {
+			return fmt.Errorf("%w: waiting run %s input changed", ErrOperationPlanChanged, request.Run.ID)
+		}
+		if pending.Request.Operation.SessionID != request.Run.SessionID {
+			return fmt.Errorf("%w: waiting run %s approval session changed", ErrOperationPlanChanged, request.Run.ID)
+		}
+		currentRevision := uint64(0)
+		if existing, exists := s.sessions[request.Run.SessionID]; request.Run.SessionID != "" && exists {
+			currentRevision = existing.Revision
+		}
+		if pending.Request.Checkpoint.ExpectedSessionRevision != currentRevision {
+			return fmt.Errorf(
+				"%w: waiting run %s expects session revision %d, current revision is %d",
+				ErrOperationPlanChanged,
+				request.Run.ID,
+				pending.Request.Checkpoint.ExpectedSessionRevision,
+				currentRevision,
+			)
+		}
+		clonedPending, err := clonePendingApprovalCommitForTest(pending)
+		if err != nil {
+			return err
+		}
+		pendingApproval = &clonedPending
 	}
 	var session *SessionState
+	sessionExists := false
+	newBinding := false
+	expiredActiveRunID := ""
+	now := s.currentTime()
 	if request.Run.SessionID != "" {
 		if request.LeaseID == "" || request.LeaseTTL <= 0 {
-			return BeginRunResult{}, errors.New("recordingStore: valid session lease is required")
+			return errors.New("recordingStore: valid session lease is required")
 		}
-		existing, sessionExists := s.sessions[request.Run.SessionID]
+		existing, exists := s.sessions[request.Run.SessionID]
+		sessionExists = exists
 		if sessionExists && existing.SkillSetID != request.Run.SkillSetID {
-			return BeginRunResult{}, fmt.Errorf("%w: session %s", ErrSkillSetMismatch, request.Run.SessionID)
+			return fmt.Errorf("%w: session %s", ErrSkillSetMismatch, request.Run.SessionID)
 		}
-		now := s.currentTime()
+		if sessionExists && existing.OperationSetID != "" && existing.OperationSetID != request.Run.OperationSetID {
+			return fmt.Errorf("%w: session %s operation set", ErrOperationPlanChanged, request.Run.SessionID)
+		}
 		if active, ok := s.leases[request.Run.SessionID]; ok {
 			activeRunFound := false
 			for i := range s.runs {
@@ -179,28 +300,23 @@ func (s *recordingStore) BeginRun(ctx context.Context, request BeginRunRequest) 
 				}
 				activeRunFound = true
 				if s.runs[i].SkillSetID != request.Run.SkillSetID {
-					return BeginRunResult{}, fmt.Errorf("%w: active run %s", ErrSkillSetMismatch, active.RunID)
+					return fmt.Errorf("%w: active run %s", ErrSkillSetMismatch, active.RunID)
+				}
+				if s.runs[i].OperationSetID != request.Run.OperationSetID {
+					return fmt.Errorf("%w: active run %s operation set", ErrOperationPlanChanged, active.RunID)
 				}
 				break
 			}
 			if !activeRunFound {
-				return BeginRunResult{}, fmt.Errorf("%w: active run %s is missing", ErrSessionConflict, active.RunID)
+				return fmt.Errorf("%w: active run %s is missing", ErrSessionConflict, active.RunID)
 			}
 			if active.LeaseDeadline.After(now) {
-				return BeginRunResult{}, fmt.Errorf("%w: run %s", ErrSessionBusy, active.RunID)
+				return fmt.Errorf("%w: run %s", ErrSessionBusy, active.RunID)
 			}
-			s.abandonExpiredRunLocked(active.RunID, now)
-			delete(s.leases, request.Run.SessionID)
-		}
-		if s.leases == nil {
-			s.leases = make(map[string]RunHandle)
-		}
-		if s.leaseGenerations == nil {
-			s.leaseGenerations = make(map[string]uint64)
+			expiredActiveRunID = active.RunID
 		}
 		handle.LeaseID = request.LeaseID
-		s.leaseGenerations[request.Run.SessionID]++
-		handle.LeaseGeneration = s.leaseGenerations[request.Run.SessionID]
+		handle.LeaseGeneration = s.leaseGenerations[request.Run.SessionID] + 1
 		handle.LeaseDeadline = now.Add(request.LeaseTTL)
 		if sessionExists {
 			handle.SessionRevision = existing.Revision
@@ -209,26 +325,59 @@ func (s *recordingStore) BeginRun(ctx context.Context, request BeginRunRequest) 
 			cloned.Checkpoint = cloneContextCheckpoint(existing.Checkpoint)
 			cloned.SeenCallIDs = cloneStringsPreserveNil(existing.SeenCallIDs)
 			session = &cloned
-		} else if request.Run.SkillSetID != "" {
+		} else if request.Run.SkillSetID != "" || request.Run.OperationSetID != "" {
 			binding := SessionState{
-				ID: request.Run.SessionID, SkillSetID: request.Run.SkillSetID,
+				ID: request.Run.SessionID, SkillSetID: request.Run.SkillSetID, OperationSetID: request.Run.OperationSetID,
 				CreatedAt: request.Run.CreatedAt, UpdatedAt: request.Run.UpdatedAt,
 			}
+			session = &binding
+			newBinding = true
+		}
+	}
+	start := RunStart{Handle: handle, Session: session}
+	if resume {
+		if err := acceptResume(ResumedRun{
+			RunStart: start, PendingApprovalDigest: pendingApprovalDigest, PendingApproval: pendingApproval,
+		}); err != nil {
+			return err
+		}
+	} else if err := acceptCreate(start); err != nil {
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	commitNow := s.currentTime()
+	if request.Run.SessionID != "" && !handle.LeaseDeadline.After(commitNow) {
+		return fmt.Errorf("%w: proposed session lease expired before commit", ErrSessionConflict)
+	}
+	if request.Run.SessionID != "" {
+		if expiredActiveRunID != "" {
+			s.abandonExpiredRunLocked(expiredActiveRunID, now)
+			delete(s.leases, request.Run.SessionID)
+		}
+		if s.leases == nil {
+			s.leases = make(map[string]RunHandle)
+		}
+		if s.leaseGenerations == nil {
+			s.leaseGenerations = make(map[string]uint64)
+		}
+		if newBinding {
 			if s.sessions == nil {
 				s.sessions = make(map[string]SessionState)
 			}
-			s.sessions[request.Run.SessionID] = binding
-			cloned := binding
-			session = &cloned
+			s.sessions[request.Run.SessionID] = *session
 		}
+		s.leaseGenerations[request.Run.SessionID] = handle.LeaseGeneration
 		s.leases[request.Run.SessionID] = handle
 	}
-	if runIndex >= 0 {
+	if resume {
+		request.Run.PendingApprovalDigest = pendingApprovalDigest
 		s.runs[runIndex] = request.Run
 	} else {
 		s.runs = append(s.runs, request.Run)
 	}
-	return BeginRunResult{Handle: handle, Session: session}, nil
+	return nil
 }
 
 func (s *recordingStore) RenewRunLease(ctx context.Context, request RenewRunLeaseRequest) (RunHandle, error) {
@@ -305,19 +454,29 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 	if s.runs[storedRunIndex].SkillSetID != run.SkillSetID {
 		return fmt.Errorf("%w: run %s", ErrSkillSetMismatch, run.ID)
 	}
+	if s.runs[storedRunIndex].OperationSetID != run.OperationSetID {
+		return fmt.Errorf("%w: run %s operation set", ErrOperationPlanChanged, run.ID)
+	}
 	if run.SessionID != "" {
 		existing, exists := s.sessions[run.SessionID]
 		if exists && existing.SkillSetID != run.SkillSetID {
 			return fmt.Errorf("%w: session %s", ErrSkillSetMismatch, run.SessionID)
 		}
-		if run.SkillSetID != "" && !exists {
-			return fmt.Errorf("%w: session %s has no SkillSet binding", ErrSessionConflict, run.SessionID)
+		if exists && existing.OperationSetID != "" && existing.OperationSetID != run.OperationSetID {
+			return fmt.Errorf("%w: session %s operation set", ErrOperationPlanChanged, run.SessionID)
+		}
+		if (run.SkillSetID != "" || run.OperationSetID != "") && !exists {
+			return fmt.Errorf("%w: session %s has no immutable runtime binding", ErrSessionConflict, run.SessionID)
 		}
 		if request.Session != nil && request.Session.SkillSetID != run.SkillSetID {
 			return fmt.Errorf("%w: session %s snapshot", ErrSkillSetMismatch, run.SessionID)
 		}
+		if request.Session != nil && request.Session.OperationSetID != run.OperationSetID {
+			return fmt.Errorf("%w: session %s snapshot operation set", ErrOperationPlanChanged, run.SessionID)
+		}
 	}
 	var approvalAudit *ItemRecord
+	var approvalCommit *PendingApprovalCommit
 	if request.PendingApproval != nil {
 		pending := request.PendingApproval
 		if run.Status != RunStatusWaitingUser || !pending.Decision.Pending || pending.Decision.Approved ||
@@ -329,9 +488,47 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 		if err != nil || !bytes.Equal(pending.Audit.Data, expected) {
 			return fmt.Errorf("recordingStore: invalid pending approval audit for run %s", run.ID)
 		}
+		expectedDigest, err := pendingApprovalAuthorityDigest(*pending)
+		if err != nil || pending.Digest == "" || pending.Digest != expectedDigest || run.PendingApprovalDigest != pending.Digest {
+			return fmt.Errorf("recordingStore: invalid pending approval digest for run %s", run.ID)
+		}
+		committedRevision := uint64(0)
+		if run.SessionID != "" {
+			if request.Session != nil {
+				committedRevision = request.Session.Revision
+			} else if existing, exists := s.sessions[run.SessionID]; exists {
+				committedRevision = existing.Revision
+			}
+		}
+		if pending.Request.Checkpoint == nil || pending.Request.Checkpoint.ExpectedSessionRevision != committedRevision {
+			return fmt.Errorf("recordingStore: pending approval session revision does not match waiting commit for run %s", run.ID)
+		}
+		commit, err := clonePendingApprovalCommitForTest(*pending)
+		if err != nil {
+			return err
+		}
+		approvalCommit = &commit
 		cloned := pending.Audit
 		cloned.Data = append(json.RawMessage(nil), pending.Audit.Data...)
 		approvalAudit = &cloned
+	}
+	if approvalCommit == nil && run.Status == RunStatusWaitingUser && run.PendingApprovalDigest != "" {
+		persisted, ok := s.pendingApprovals[run.ID]
+		if !ok || persisted.Digest != run.PendingApprovalDigest {
+			return fmt.Errorf("recordingStore: waiting run %s has no matching pending approval", run.ID)
+		}
+		currentRevision := uint64(0)
+		if existing, exists := s.sessions[run.SessionID]; run.SessionID != "" && exists {
+			currentRevision = existing.Revision
+		}
+		if persisted.Request.Checkpoint == nil || persisted.Request.Checkpoint.ExpectedSessionRevision != currentRevision {
+			return fmt.Errorf("%w: waiting run %s approval session revision changed", ErrOperationPlanChanged, run.ID)
+		}
+	}
+	if approvalAudit != nil {
+		if err := s.requireAvailableItemIdentityLocked(approvalAudit.ID); err != nil {
+			return err
+		}
 	}
 	if run.SessionID != "" {
 		active, ok := s.leases[run.SessionID]
@@ -363,6 +560,14 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 	}
 	if approvalAudit != nil {
 		s.items = append(s.items, *approvalAudit)
+	}
+	if approvalCommit != nil {
+		if s.pendingApprovals == nil {
+			s.pendingApprovals = make(map[string]PendingApprovalCommit)
+		}
+		s.pendingApprovals[run.ID] = *approvalCommit
+	} else if run.Status != RunStatusWaitingUser || run.PendingApprovalDigest == "" {
+		delete(s.pendingApprovals, run.ID)
 	}
 	s.runs[storedRunIndex] = run
 	delete(s.leases, run.SessionID)
@@ -405,13 +610,58 @@ func cloneVerificationPointerForTest(verification *VerificationResult) *Verifica
 	return &out
 }
 
+func clonePendingApprovalCommitForTest(pending PendingApprovalCommit) (PendingApprovalCommit, error) {
+	request := pending.Request
+	input, err := cloneOperationInput(request.Operation.Input)
+	if err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	request.Operation.Input = input
+	request.Operation.Operation = cloneOperationSummaries([]OperationSummary{request.Operation.Operation})[0]
+	request.Operation.Call.Input = append(json.RawMessage(nil), request.Operation.Call.Input...)
+	arguments, err := json.Marshal(request.Operation.Arguments)
+	if err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.UseNumber()
+	request.Operation.Arguments = nil
+	if err := decoder.Decode(&request.Operation.Arguments); err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	request.ModelOutput = cloneModelOutputItems(request.ModelOutput)
+	request.Preview = append(json.RawMessage(nil), request.Preview...)
+	request.Checkpoint = cloneApprovalCheckpoint(request.Checkpoint, true)
+	audit := pending.Audit
+	audit.Data = append(json.RawMessage(nil), pending.Audit.Data...)
+	return PendingApprovalCommit{
+		AuthorityVersion: pending.AuthorityVersion,
+		Request:          request, Decision: pending.Decision, Audit: audit, Digest: pending.Digest,
+	}, nil
+}
+
+func (s *recordingStore) pendingApprovalForTest(runID string) (*PendingApprovalCommit, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.pendingApprovals[runID]
+	if !ok {
+		return nil, nil
+	}
+	cloned, err := clonePendingApprovalCommitForTest(pending)
+	if err != nil {
+		return nil, err
+	}
+	return &cloned, nil
+}
+
 func newTestRuntime(t *testing.T, model Model, ops *OperationRegistry, policy OperationPolicy, executor OperationExecutor, verifier ResultVerifier, approver Approver, store RunStore) *Runtime {
 	return newTestRuntimeWithEventSink(t, model, ops, policy, executor, verifier, approver, store, nil)
 }
 
+var testRuntimeIdentitySequence atomic.Uint64
+
 func newTestRuntimeWithEventSink(t *testing.T, model Model, ops *OperationRegistry, policy OperationPolicy, executor OperationExecutor, verifier ResultVerifier, approver Approver, store RunStore, eventSink EventSink) *Runtime {
 	t.Helper()
-	nextID := 0
 	var executions ExecutionStore
 	if value, ok := store.(ExecutionStore); ok {
 		executions = value
@@ -420,14 +670,19 @@ func newTestRuntimeWithEventSink(t *testing.T, model Model, ops *OperationRegist
 	if value, ok := approver.(ApprovalResumer); ok {
 		approvalResumer = value
 	}
-	rt, err := NewRuntime(RuntimeConfig{
+	config := RuntimeConfig{
 		Model: model, Operations: ops, Policy: policy,
 		Executor: executor, Verifier: verifier, Approver: approver, ApprovalResumer: approvalResumer,
 		RunStore: store, Executions: executions,
 		EventSink: eventSink,
 		Now:       func() time.Time { return time.Unix(10, 0) },
-		NewID:     func() string { nextID++; return fmt.Sprintf("id-%d", nextID) },
-	})
+	}
+	if store != nil {
+		config.NewID = func() string {
+			return fmt.Sprintf("test-runtime-id-%d", testRuntimeIdentitySequence.Add(1))
+		}
+	}
+	rt, err := NewRuntime(config)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}

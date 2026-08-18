@@ -29,10 +29,14 @@ type ModelInputItem struct {
 	Type        ModelInputItemType     `json:"type"`
 	Text        string                 `json:"text,omitempty"`
 	Attachments []ModelInputAttachment `json:"attachments,omitempty"`
-	OutputType  ModelOutputItemType    `json:"output_type,omitempty"`
-	Raw         json.RawMessage        `json:"raw,omitempty"`
-	CallID      string                 `json:"call_id,omitempty"`
-	Output      json.RawMessage        `json:"output,omitempty"`
+	// ResponseID binds retained assistant output to the model response that
+	// produced it. Runtime writes it on every item in a response so compaction
+	// can retain bounded cross-turn response identity without provider state.
+	ResponseID string              `json:"response_id,omitempty"`
+	OutputType ModelOutputItemType `json:"output_type,omitempty"`
+	Raw        json.RawMessage     `json:"raw,omitempty"`
+	CallID     string              `json:"call_id,omitempty"`
+	Output     json.RawMessage     `json:"output,omitempty"`
 }
 
 type ModelInputAttachment struct {
@@ -183,7 +187,11 @@ type ModelOutputItem struct {
 	Type ModelOutputItemType `json:"type"`
 	Text string              `json:"text,omitempty"`
 	Call *ToolCall           `json:"call,omitempty"`
-	Raw  json.RawMessage     `json:"raw,omitempty"`
+	// Raw is the replayable provider envelope. It must be an exact JSON object
+	// whose "type" equals Type; function-call envelopes must also identify the
+	// same call ID, operation name, and semantic arguments as Call. Message and
+	// reasoning envelopes must retain their required replay field shapes.
+	Raw json.RawMessage `json:"raw,omitempty"`
 }
 
 type ModelRequest struct {
@@ -242,6 +250,9 @@ type ModelStreamEvent struct {
 // incremental tool arguments remain available to trusted in-process sinks but
 // are not exposed by adapters that directly encode Event as JSON.
 func (e ModelStreamEvent) MarshalJSON() ([]byte, error) {
+	if err := validateUTF8Boundary("model stream event", e); err != nil {
+		return nil, err
+	}
 	type publicModelStreamEvent ModelStreamEvent
 	public := publicModelStreamEvent(e)
 	public.RawJSON = ""
@@ -274,7 +285,8 @@ func safePublicErrorCode(code string) string {
 
 // ModelStreamSink observes ordered transport chunks and completion boundaries.
 // Callbacks run synchronously and provide backpressure. Implementations must not
-// mutate event data after invoking the callback. A completed ModelResponse remains
+// mutate event data after invoking the callback. Invalid UTF-8 in any event field
+// fails the model turn before observer delivery. A completed ModelResponse remains
 // authoritative: tool argument chunks are never executable input.
 type ModelStreamSink func(ModelStreamEvent)
 
@@ -310,15 +322,30 @@ type Model interface {
 
 func toolDefinitionsID(tools []ToolDefinition) string {
 	digest := sha256.New()
-	for _, tool := range tools {
+	writeHashField(digest, []byte("agentruntime.tool-definitions.v2"))
+	writeHashUint64(digest, uint64(len(tools)))
+	for index, tool := range tools {
+		writeHashField(digest, []byte("tool"))
+		writeHashUint64(digest, uint64(index))
+		writeHashField(digest, []byte("name"))
 		writeHashField(digest, []byte(tool.Name))
+		writeHashField(digest, []byte("previous_names"))
+		writeHashUint64(digest, uint64(len(tool.PreviousNames)))
 		for _, previousName := range tool.PreviousNames {
 			writeHashField(digest, []byte(previousName))
 		}
+		writeHashField(digest, []byte("description"))
 		writeHashField(digest, []byte(tool.Description))
-		writeHashField(digest, tool.InputSchema)
+		writeHashField(digest, []byte("input_schema"))
+		writeHashField(digest, operationSchemaIdentity(tool.InputSchema, nil))
 	}
 	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func writeHashUint64(digest hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	_, _ = digest.Write(encoded[:])
 }
 
 func writeHashField(digest hash.Hash, value []byte) {

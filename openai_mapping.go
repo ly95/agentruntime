@@ -69,11 +69,14 @@ func buildOpenAIInputItems(items []ModelInputItem) ([]responses.ResponseInputIte
 			}
 			out = append(out, replayed)
 		case ModelInputToolResult:
-			if strings.TrimSpace(item.CallID) == "" {
-				return nil, fmt.Errorf("agent: tool result item %d call_id is required", i)
+			if err := requireCanonicalIdentity(item.CallID, "tool result call_id"); err != nil {
+				return nil, fmt.Errorf("agent: tool result item %d: %v", i, err)
 			}
-			if len(item.Output) == 0 || !json.Valid(item.Output) {
+			if len(item.Output) == 0 {
 				return nil, fmt.Errorf("agent: tool result item %d output must be valid JSON", i)
+			}
+			if _, err := decodeExactJSON(item.Output); err != nil {
+				return nil, fmt.Errorf("agent: tool result item %d output must be unambiguous valid JSON: %v", i, err)
 			}
 			out = append(out, responses.ResponseInputItemUnionParam{
 				OfFunctionCallOutput: &responses.ResponseInputItemFunctionCallOutputParam{
@@ -91,20 +94,18 @@ func buildOpenAIInputItems(items []ModelInputItem) ([]responses.ResponseInputIte
 }
 
 func buildOpenAIReplayItem(item ModelInputItem) (responses.ResponseInputItemUnionParam, error) {
-	if len(item.Raw) == 0 || !json.Valid(item.Raw) {
-		return responses.ResponseInputItemUnionParam{}, errors.New("raw output must be valid JSON")
-	}
-	var envelope struct {
-		Type ModelOutputItemType `json:"type"`
-	}
-	if err := json.Unmarshal(item.Raw, &envelope); err != nil {
+	if err := validateModelInputItemForReplay(item); err != nil {
 		return responses.ResponseInputItemUnionParam{}, err
 	}
-	if envelope.Type != item.OutputType {
-		return responses.ResponseInputItemUnionParam{}, fmt.Errorf("output type %q does not match raw type %q", item.OutputType, envelope.Type)
+	object, err := decodeModelOutputObject(item.Raw, item.OutputType)
+	if err != nil {
+		return responses.ResponseInputItemUnionParam{}, err
 	}
 	switch item.OutputType {
 	case ModelOutputMessage:
+		if _, ok := object["content"].([]any); !ok {
+			return responses.ResponseInputItemUnionParam{}, errors.New("OpenAI message raw content must be an array")
+		}
 		var message responses.ResponseOutputMessageParam
 		if err := json.Unmarshal(item.Raw, &message); err != nil {
 			return responses.ResponseInputItemUnionParam{}, err
@@ -117,6 +118,14 @@ func buildOpenAIReplayItem(item ModelInputItem) (responses.ResponseInputItemUnio
 		}
 		return responses.ResponseInputItemUnionParam{OfReasoning: &reasoning}, nil
 	case ModelOutputFunctionCall:
+		name, nameOK := object["name"].(string)
+		arguments, argumentsOK := object["arguments"].(string)
+		if !nameOK || strings.TrimSpace(name) == "" || !argumentsOK {
+			return responses.ResponseInputItemUnionParam{}, errors.New("OpenAI function call raw name and arguments are required")
+		}
+		if _, err := decodeExactJSON(json.RawMessage(arguments)); err != nil {
+			return responses.ResponseInputItemUnionParam{}, fmt.Errorf("OpenAI function call raw arguments are ambiguous or invalid: %v", err)
+		}
 		var call responses.ResponseFunctionToolCallParam
 		if err := json.Unmarshal(item.Raw, &call); err != nil {
 			return responses.ResponseInputItemUnionParam{}, err
@@ -159,6 +168,9 @@ func parseOpenAIResponseWithFinalizedCalls(
 	raw *responses.Response,
 	finalizedCalls map[string]openAIStreamFunctionCall,
 ) (*ModelResponse, error) {
+	if err := validateOpenAIResponseEnvelope(raw); err != nil {
+		return nil, err
+	}
 	outputText, refusal, err := openAIFinalMessageText(raw)
 	if err != nil {
 		return nil, err
@@ -184,6 +196,9 @@ func parseOpenAIResponseWithFinalizedCalls(
 		if len(data) == 0 || !json.Valid(data) {
 			return nil, fmt.Errorf("agent: OpenAI output item %q is missing its raw JSON", item.ID)
 		}
+		if _, err := decodeExactJSON(data); err != nil {
+			return nil, fmt.Errorf("agent: OpenAI output item %q has ambiguous or invalid raw JSON: %w", item.ID, err)
+		}
 		parsed := ModelOutputItem{ID: item.ID, Type: ModelOutputItemType(item.Type), Raw: data}
 		if item.Type == string(ModelOutputReasoning) {
 			out.HadReasoning = true
@@ -196,9 +211,41 @@ func parseOpenAIResponseWithFinalizedCalls(
 				return nil, err
 			}
 		}
+		if err := validateModelOutputItem(parsed); err != nil {
+			return nil, fmt.Errorf("agent: OpenAI output item %q cannot be replayed: %w", item.ID, err)
+		}
 		out.Items = append(out.Items, parsed)
 	}
+	if err := validateModelResponseReplayIdentity(out); err != nil {
+		return nil, fmt.Errorf("%w: OpenAI response identity is invalid: %v", ErrInvalidModelOutput, err)
+	}
 	return out, nil
+}
+
+func validateOpenAIResponseEnvelope(raw *responses.Response) error {
+	if raw == nil {
+		return fmt.Errorf("%w: OpenAI response is nil", ErrInvalidModelOutput)
+	}
+	if err := requireCanonicalIdentity(raw.ID, "OpenAI response id"); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidModelOutput, err)
+	}
+	if raw.Status != responses.ResponseStatusCompleted {
+		return fmt.Errorf("%w: OpenAI response %q has unsupported status %q", ErrInvalidModelOutput, raw.ID, raw.Status)
+	}
+	seenItemIDs := make(map[string]struct{}, len(raw.Output))
+	for index, item := range raw.Output {
+		if err := requireCanonicalIdentity(item.ID, "OpenAI output item id"); err != nil {
+			return fmt.Errorf("%w: OpenAI output item %d: %v", ErrInvalidModelOutput, index, err)
+		}
+		if _, exists := seenItemIDs[item.ID]; exists {
+			return fmt.Errorf("%w: OpenAI response repeats output item id %q", ErrInvalidModelOutput, item.ID)
+		}
+		seenItemIDs[item.ID] = struct{}{}
+		if item.Status != string(responses.ResponseStatusCompleted) {
+			return fmt.Errorf("%w: OpenAI output item %q has unsupported status %q", ErrInvalidModelOutput, item.ID, item.Status)
+		}
+	}
+	return nil
 }
 
 func parseOpenAIFunctionCall(
@@ -207,28 +254,46 @@ func parseOpenAIFunctionCall(
 	raw json.RawMessage,
 	finalizedCalls map[string]openAIStreamFunctionCall,
 ) (*ToolCall, json.RawMessage, error) {
-	callID := strings.TrimSpace(call.CallID)
-	name := strings.TrimSpace(call.Name)
+	callID := call.CallID
+	name := call.Name
 	arguments := call.Arguments
-	if callID == "" || name == "" {
+	if err := requireCanonicalIdentity(callID, "OpenAI function call id"); err != nil {
 		return nil, nil, fmt.Errorf(
-			"%w: OpenAI function call %q is missing its call id or name",
+			"%w: OpenAI function call %q: %v",
 			ErrInvalidModelOutput,
 			itemID,
+			err,
 		)
 	}
-	if arguments != "" && json.Valid([]byte(arguments)) {
-		return &ToolCall{
-			ID: callID, Name: name, Input: json.RawMessage(arguments),
-		}, raw, nil
+	if err := requireCanonicalIdentity(name, "OpenAI function call name"); err != nil {
+		return nil, nil, fmt.Errorf("%w: OpenAI function call %q: %v", ErrInvalidModelOutput, itemID, err)
 	}
 	finalized, ok := finalizedCalls[itemID]
-	if !ok || !finalized.Finalized || finalized.Arguments == "" ||
-		!json.Valid([]byte(finalized.Arguments)) {
+	if !ok {
+		if arguments != "" && json.Valid([]byte(arguments)) {
+			return &ToolCall{
+				ID: callID, Name: name, Input: json.RawMessage(arguments),
+			}, raw, nil
+		}
 		return nil, nil, fmt.Errorf(
 			"%w: OpenAI function call %q has invalid JSON arguments",
 			ErrInvalidModelOutput,
 			itemID,
+		)
+	}
+	if !finalized.Finalized || finalized.Arguments == "" || !json.Valid([]byte(finalized.Arguments)) {
+		return nil, nil, fmt.Errorf(
+			"%w: OpenAI function call %q has invalid JSON arguments",
+			ErrInvalidModelOutput,
+			itemID,
+		)
+	}
+	if call.Status != responses.ResponseFunctionToolCallStatusCompleted {
+		return nil, nil, fmt.Errorf(
+			"%w: OpenAI function call %q cannot use finalized stream arguments with status %q",
+			ErrInvalidModelOutput,
+			itemID,
+			call.Status,
 		)
 	}
 	if finalized.CallID != "" && finalized.CallID != callID {
@@ -244,6 +309,15 @@ func parseOpenAIFunctionCall(
 			ErrInvalidModelOutput,
 			itemID,
 		)
+	}
+	if arguments != "" {
+		if !json.Valid([]byte(arguments)) {
+			return nil, nil, fmt.Errorf("%w: OpenAI function call %q has invalid JSON arguments", ErrInvalidModelOutput, itemID)
+		}
+		if !jsonSemanticallyEqual(json.RawMessage(arguments), json.RawMessage(finalized.Arguments)) {
+			return nil, nil, fmt.Errorf("%w: OpenAI function call %q arguments conflict with its finalized stream item", ErrInvalidModelOutput, itemID)
+		}
+		return &ToolCall{ID: callID, Name: name, Input: json.RawMessage(arguments)}, raw, nil
 	}
 	raw, err := replaceOpenAIFunctionArguments(raw, finalized.Arguments)
 	if err != nil {
@@ -263,15 +337,15 @@ func replaceOpenAIFunctionArguments(
 	raw json.RawMessage,
 	arguments string,
 ) (json.RawMessage, error) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil {
-		return nil, err
-	}
-	encodedArguments, err := json.Marshal(arguments)
+	value, err := decodeExactJSON(raw)
 	if err != nil {
 		return nil, err
 	}
-	object["arguments"] = encodedArguments
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("OpenAI function call raw payload must be an object")
+	}
+	object["arguments"] = arguments
 	return json.Marshal(object)
 }
 

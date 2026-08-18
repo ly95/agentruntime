@@ -1,7 +1,6 @@
 package agentruntime
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +35,11 @@ type ConfirmationSpec struct {
 
 type Operation struct {
 	Name string
+	// ContractVersion is a host-owned immutable version for executor,
+	// normalization, and approval-preview behavior that cannot be derived from
+	// declarative schemas. Write operations must set it and bump it whenever
+	// those semantics change.
+	ContractVersion string
 	// PreviousNames are accepted only when replaying persisted model transcript
 	// items after an operation rename. They are never registered as executable
 	// operation names or exposed as current tools to the model.
@@ -45,7 +49,8 @@ type Operation struct {
 	OutputSchema  json.RawMessage
 	// NormalizeInput canonicalizes schema-validated arguments before execution
 	// IDs, durable plans, approval previews, and executions are created. It must
-	// not mutate its input and its result is validated again.
+	// not mutate its input. Its result is normalized into the native exact-JSON
+	// data model; custom JSON/Text encoders are rejected before validation.
 	NormalizeInput func(arguments any) (any, error)
 	Effect         OperationEffect
 	Capabilities   []string
@@ -64,10 +69,18 @@ type Operation struct {
 	// Runtime still plans, fences, executes, validates, and persists every call
 	// independently before completing the turn with their combined artifacts.
 	TerminalBatchLimit int
+	// ProjectTerminalSession declares the exact host-authored session projection
+	// a terminal write will return for these normalized arguments. Runtime
+	// validates the complete accumulated projection before invoking the executor
+	// and rejects any returned projection that differs from this declaration.
+	ProjectTerminalSession func(arguments any) ([]TerminalSessionProjection, error)
+	inputSchemaIdentity    json.RawMessage
+	outputSchemaIdentity   json.RawMessage
 }
 
 type OperationSummary struct {
 	Name               string           `json:"name"`
+	ContractID         string           `json:"contract_id"`
 	PreviousNames      []string         `json:"-"`
 	Description        string           `json:"description,omitempty"`
 	InputSchema        json.RawMessage  `json:"input_schema"`
@@ -168,7 +181,12 @@ func (r *OperationRegistry) Register(op Operation) error {
 }
 
 func normalizeAndValidateOperation(op *Operation) error {
+	if err := validateUTF8Boundary("operation contract", op); err != nil {
+		return err
+	}
 	op.Name = strings.TrimSpace(op.Name)
+	op.ContractVersion = strings.TrimSpace(op.ContractVersion)
+	op.Description = strings.TrimSpace(op.Description)
 	if op.Name == "" {
 		return fmt.Errorf("agent: operation name is required")
 	}
@@ -178,17 +196,36 @@ func normalizeAndValidateOperation(op *Operation) error {
 			return fmt.Errorf("agent: operation %q has invalid previous name %q", op.Name, previousName)
 		}
 	}
-	if len(op.InputSchema) == 0 || !json.Valid(op.InputSchema) {
+	if len(op.InputSchema) == 0 {
 		return fmt.Errorf("agent: operation input schema is required and must be valid JSON: %s", op.Name)
 	}
-	if len(op.OutputSchema) == 0 || !json.Valid(op.OutputSchema) {
+	if _, err := decodeExactJSON(op.InputSchema); err != nil {
+		return fmt.Errorf("agent: operation input schema must be unambiguous valid JSON %q: %w", op.Name, err)
+	}
+	canonicalInputSchema, err := canonicalJSONIdentity(op.InputSchema)
+	if err != nil {
+		return fmt.Errorf("agent: canonicalize operation input schema %q: %w", op.Name, err)
+	}
+	op.inputSchemaIdentity = canonicalInputSchema
+	if len(op.OutputSchema) == 0 {
 		return fmt.Errorf("agent: operation output schema is required and must be valid JSON: %s", op.Name)
 	}
+	if _, err := decodeExactJSON(op.OutputSchema); err != nil {
+		return fmt.Errorf("agent: operation output schema must be unambiguous valid JSON %q: %w", op.Name, err)
+	}
+	canonicalOutputSchema, err := canonicalJSONIdentity(op.OutputSchema)
+	if err != nil {
+		return fmt.Errorf("agent: canonicalize operation output schema %q: %w", op.Name, err)
+	}
+	op.outputSchemaIdentity = canonicalOutputSchema
 	if err := validateOperationInputSchema(op.InputSchema); err != nil {
 		return fmt.Errorf("agent: operation %q input schema: %w", op.Name, err)
 	}
 	if op.Effect != OperationEffectRead && op.Effect != OperationEffectWrite {
 		return fmt.Errorf("agent: operation %q effect must be read or write", op.Name)
+	}
+	if op.Effect == OperationEffectWrite && op.ContractVersion == "" {
+		return fmt.Errorf("agent: write operation %q contract version is required", op.Name)
 	}
 	if op.TerminalBatchLimit != 0 {
 		if !op.Terminal || op.Effect != OperationEffectWrite {
@@ -200,6 +237,9 @@ func normalizeAndValidateOperation(op *Operation) error {
 				op.Name, MaxTerminalBatchLimit,
 			)
 		}
+	}
+	if op.Terminal && op.Effect == OperationEffectWrite && op.ProjectTerminalSession == nil {
+		return fmt.Errorf("agent: terminal write operation %q requires a session projection", op.Name)
 	}
 	if op.Confirmation.Mode != ConfirmationNone && op.Confirmation.Mode != ConfirmationRequired {
 		return fmt.Errorf("agent: operation %q confirmation mode must be none or required", op.Name)
@@ -332,13 +372,8 @@ func (r *OperationRegistry) DecodeInput(name string, input json.RawMessage) (any
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrOperationNotFound, name)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(input))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("agent: operation %q input is invalid JSON: %w", name, err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
+	value, err := decodeExactJSON(input)
+	if err != nil {
 		return nil, fmt.Errorf("agent: operation %q input is invalid JSON: %w", name, err)
 	}
 	declaredErr := schemas.declared.Validate(value)
@@ -371,7 +406,11 @@ func (r *OperationRegistry) NormalizeInput(name string, arguments any) (any, err
 	}
 	normalized, err := op.NormalizeInput(arguments)
 	if err != nil {
-		return nil, fmt.Errorf("agent: normalize operation %q input: %w", name, err)
+		return nil, fmt.Errorf("agent: normalize operation %q input: %w", name, validateUTF8Error("operation input normalizer", err))
+	}
+	normalized, err = normalizeExactJSONHostValue("normalized operation input", normalized)
+	if err != nil {
+		return nil, err
 	}
 	raw, err := json.Marshal(normalized)
 	if err != nil {
@@ -399,13 +438,8 @@ func (r *OperationRegistry) DecodeOutput(name string, output json.RawMessage) (a
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrOperationNotFound, name)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("agent: operation %q output is invalid JSON: %w", name, err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
+	value, err := decodeExactJSON(output)
+	if err != nil {
 		return nil, fmt.Errorf("agent: operation %q output is invalid JSON: %w", name, err)
 	}
 	if err := schema.Validate(value); err != nil {

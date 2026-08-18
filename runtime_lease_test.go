@@ -116,7 +116,7 @@ func TestLeaseRenewalStopsAfterCancellationGrace(t *testing.T) {
 		secondStarted:  make(chan struct{}),
 		secondCanceled: make(chan struct{}),
 	}
-	begun, err := store.BeginRun(t.Context(), BeginRunRequest{
+	begun, err := createRunForTest(t.Context(), store, CreateRunRequest{
 		Run:     RunRecord{ID: "run-cancel-grace", SessionID: "session-cancel-grace", Status: RunStatusRunning},
 		LeaseID: "lease-cancel-grace", LeaseTTL: time.Minute,
 	})
@@ -292,7 +292,7 @@ func TestRuntimeKeepsSessionLeaseRenewalActiveThroughFailureCleanup(t *testing.T
 func TestRunStoreExpiresAndFencesAbandonedSessionLease(t *testing.T) {
 	now := time.Unix(100, 0)
 	store := &recordingStore{now: func() time.Time { return now }}
-	first, err := store.BeginRun(context.Background(), BeginRunRequest{
+	first, err := createRunForTest(context.Background(), store, CreateRunRequest{
 		Run:     RunRecord{ID: "run-1", SessionID: "session-lease", Status: RunStatusRunning},
 		LeaseID: "lease-1", LeaseTTL: time.Minute,
 	})
@@ -300,7 +300,7 @@ func TestRunStoreExpiresAndFencesAbandonedSessionLease(t *testing.T) {
 		t.Fatalf("first BeginRun: %v", err)
 	}
 	now = now.Add(2 * time.Minute)
-	second, err := store.BeginRun(context.Background(), BeginRunRequest{
+	second, err := createRunForTest(context.Background(), store, CreateRunRequest{
 		Run:     RunRecord{ID: "run-2", SessionID: "session-lease", Status: RunStatusRunning},
 		LeaseID: "lease-2", LeaseTTL: time.Minute,
 	})
@@ -321,7 +321,7 @@ func TestRunStoreExpiresAndFencesAbandonedSessionLease(t *testing.T) {
 func TestRunStoreRejectsSkillSetSwitchBeforeFencingExpiredLease(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	store := &recordingStore{now: func() time.Time { return now }}
-	first, err := store.BeginRun(context.Background(), BeginRunRequest{
+	first, err := createRunForTest(context.Background(), store, CreateRunRequest{
 		Run: RunRecord{
 			ID: "bound-run-1", SessionID: "bound-session", SkillSetID: "set-a",
 			Status: RunStatusRunning, CreatedAt: now, UpdatedAt: now,
@@ -332,7 +332,7 @@ func TestRunStoreRejectsSkillSetSwitchBeforeFencingExpiredLease(t *testing.T) {
 		t.Fatalf("first BeginRun: %v", err)
 	}
 	now = now.Add(2 * time.Minute)
-	_, err = store.BeginRun(context.Background(), BeginRunRequest{
+	_, err = createRunForTest(context.Background(), store, CreateRunRequest{
 		Run: RunRecord{
 			ID: "bound-run-2", SessionID: "bound-session", SkillSetID: "set-b",
 			Status: RunStatusRunning, CreatedAt: now, UpdatedAt: now,
@@ -352,7 +352,7 @@ func TestRunStoreRejectsSkillSetSwitchBeforeFencingExpiredLease(t *testing.T) {
 		t.Fatalf("binding=%+v", binding)
 	}
 
-	second, err := store.BeginRun(context.Background(), BeginRunRequest{
+	second, err := createRunForTest(context.Background(), store, CreateRunRequest{
 		Run: RunRecord{
 			ID: "bound-run-2", SessionID: "bound-session", SkillSetID: "set-a",
 			Status: RunStatusRunning, CreatedAt: now, UpdatedAt: now,
@@ -422,6 +422,11 @@ func TestRuntimeRejectsLostAttemptBeforeWriteSideEffect(t *testing.T) {
 	}
 	if executions != 0 {
 		t.Fatalf("executor calls=%d, want 0", executions)
+	}
+	for _, execution := range store.executions {
+		if execution.Status != OperationExecutionRetryable {
+			t.Fatalf("execution status=%q, want retryable after contradictory lost-attempt response", execution.Status)
+		}
 	}
 }
 

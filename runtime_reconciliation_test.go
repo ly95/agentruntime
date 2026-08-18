@@ -72,6 +72,32 @@ func TestRuntimeRetriesWriteAfterExplicitReconciliation(t *testing.T) {
 	}
 }
 
+func TestExecutionTransitionRejectsConfirmedCompletionWithoutVerification(t *testing.T) {
+	transition := OperationExecutionTransition{
+		ID: "transition-1", ExecutionID: "execution-1", AttemptID: "attempt-1",
+		RunID: "run-1", CallID: "call-1", Actor: "operator", Message: "completed",
+		From: OperationExecutionUnknown, To: OperationExecutionCompleted, VerificationRequired: true,
+		Result: OperationResult{Output: json.RawMessage(`{"applied":true}`)}, CreatedAt: time.Unix(10, 0),
+	}
+	if err := transition.Validate(); !errors.Is(err, ErrInvalidExecutionTransition) {
+		t.Fatalf("Validate error=%v, want ErrInvalidExecutionTransition", err)
+	}
+}
+
+func TestExecutionTransitionRejectsNullEvidence(t *testing.T) {
+	for _, evidence := range []json.RawMessage{json.RawMessage(`null`), json.RawMessage(" \n null \t")} {
+		transition := OperationExecutionTransition{
+			ID: "transition-1", ExecutionID: "execution-1", AttemptID: "attempt-1",
+			RunID: "run-1", CallID: "call-1", Actor: "operator", Message: "abandoned",
+			From: OperationExecutionStarted, To: OperationExecutionRetryable,
+			Evidence: evidence, CreatedAt: time.Unix(10, 0),
+		}
+		if err := transition.Validate(); !errors.Is(err, ErrInvalidExecutionTransition) {
+			t.Fatalf("Validate evidence=%q error=%v, want ErrInvalidExecutionTransition", evidence, err)
+		}
+	}
+}
+
 func TestRuntimeReplaysHostReconciledCompletedWrite(t *testing.T) {
 	sentinel := errors.New("executor connection lost")
 	model := &scriptedModel{responses: []*ModelResponse{
@@ -107,10 +133,18 @@ func TestRuntimeReplaysHostReconciledCompletedWrite(t *testing.T) {
 		ExpectedAttemptID: unknown.AttemptID,
 		Action:            OperationReconciliationComplete,
 		Result:            OperationResult{Output: json.RawMessage(`{"applied":true}`), Receipt: json.RawMessage(`{"version":2}`)},
+		Verification:      &VerificationResult{Confirmed: true, Message: "host verified", Evidence: json.RawMessage(`{"version":2}`)},
 		Actor:             "test-host",
 		Message:           "host observed version 2",
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
+	}
+	reconciled, err := store.GetExecution(context.Background(), executionID)
+	if err != nil {
+		t.Fatalf("GetExecution after reconciliation: %v", err)
+	}
+	if reconciled.Verification == nil || !reconciled.Verification.Confirmed || string(reconciled.Verification.Evidence) != `{"version":2}` {
+		t.Fatalf("verification=%+v, want durable positive host evidence", reconciled.Verification)
 	}
 	if _, err := rt.Run(context.Background(), input); err != nil {
 		t.Fatalf("second Run: %v", err)
@@ -174,7 +208,7 @@ func TestReconcileOperationRejectsStartedAttempt(t *testing.T) {
 	execution := OperationExecutionRecord{
 		ID: "execution-active", IdempotencyKey: "request-active", IdempotencyScope: "test",
 		RunID: "run-active", CallID: "call-active", AttemptID: "attempt-active",
-		Name: "apply_change", Arguments: json.RawMessage(`{}`), Status: OperationExecutionStarted,
+		Name: "apply_change", ContractID: "test-contract", Arguments: json.RawMessage(`{}`), Status: OperationExecutionStarted,
 		CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
 	}
 	if _, err := store.AcquireExecution(context.Background(), AcquireExecutionRequest{
@@ -291,7 +325,7 @@ func TestAcquireExecutionRejectsPollutedStartedRecord(t *testing.T) {
 	execution := OperationExecutionRecord{
 		ID: "execution-1", IdempotencyKey: "request-1", IdempotencyScope: "test",
 		RunID: "run-1", CallID: "call-1", AttemptID: "attempt-1", Name: "apply_change",
-		Arguments: json.RawMessage(`{}`), Status: OperationExecutionStarted,
+		ContractID: "test-contract", Arguments: json.RawMessage(`{}`), Status: OperationExecutionStarted,
 		Result:    OperationResult{Output: json.RawMessage(`{"applied":true}`)},
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -312,7 +346,7 @@ func TestExecutionStoreRejectsStaleAttemptsAndPreservesTransitionHistory(t *test
 	store := &recordingStore{}
 	execution := OperationExecutionRecord{
 		ID: "execution-1", IdempotencyKey: "request-1", IdempotencyScope: "test", RunID: "run-1", CallID: "call-1",
-		AttemptID: "attempt-1", Name: "apply_change", Arguments: json.RawMessage(`{}`),
+		AttemptID: "attempt-1", Name: "apply_change", ContractID: "test-contract", Arguments: json.RawMessage(`{}`),
 		Status: OperationExecutionStarted, CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0),
 	}
 	acquired, err := store.AcquireExecution(context.Background(), AcquireExecutionRequest{

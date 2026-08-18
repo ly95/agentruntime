@@ -1,23 +1,28 @@
 package agentruntime
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 )
 
 type preparedOperation struct {
-	call                ToolCall
-	callData            json.RawMessage
-	operation           Operation
-	normalizedArguments json.RawMessage
-	executionID         string
-	modelOutput         []ModelOutputItem
-	responseID          string
-	batchSize           int
-	resumed             bool
+	call                    ToolCall
+	callData                json.RawMessage
+	operation               Operation
+	normalizedArguments     json.RawMessage
+	executionID             string
+	modelOutput             []ModelOutputItem
+	responseID              string
+	batchSize               int
+	resumed                 bool
+	policyDecision          PolicyDecision
+	approvalCheckpoint      *ApprovalCheckpoint
+	terminalProjection      []TerminalSessionProjection
+	terminalProjectionReady bool
 }
 
 type operationEnvelope struct {
@@ -63,22 +68,80 @@ func (envelope operationEnvelope) Request(registry *OperationRegistry, attemptID
 }
 
 func cloneOperationInput(input Input) (Input, error) {
+	boundary := input
+	boundary.ImageAttachmentResolver = nil
+	if err := validateUTF8Boundary("operation input", boundary); err != nil {
+		return Input{}, err
+	}
 	out := input
 	out.Attachments = cloneModelInputAttachments(input.Attachments)
 	if input.Metadata == nil {
 		return out, nil
 	}
-	data, err := json.Marshal(input.Metadata)
+	normalized, err := normalizeExactJSONHostValue("operation input metadata", input.Metadata)
 	if err != nil {
-		return Input{}, fmt.Errorf("agent: clone operation input metadata: %w", err)
+		return Input{}, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	out.Metadata = nil
-	if err := decoder.Decode(&out.Metadata); err != nil {
-		return Input{}, fmt.Errorf("agent: clone operation input metadata: %w", err)
+	metadata, ok := normalized.(map[string]any)
+	if !ok {
+		return Input{}, fmt.Errorf("agent: operation input metadata encoded as %T instead of a JSON object", normalized)
+	}
+	out.Metadata = metadata
+	return out, nil
+}
+
+func clonePersistentOperationInput(input Input) (Input, error) {
+	out, err := cloneOperationInput(input)
+	if err != nil {
+		return Input{}, err
+	}
+	out.ImageAttachmentResolver = nil
+	out.TrustedContext = ""
+	for index := range out.Attachments {
+		out.Attachments[index].URL = ""
+		out.Attachments[index].CurrentRun = false
 	}
 	return out, nil
+}
+
+func persistentOperationInputDigest(input Input) (string, error) {
+	trustedContextDigest := ""
+	if input.TrustedContext != "" {
+		canonicalTrustedContext, err := canonicalJSONIdentity(json.RawMessage(input.TrustedContext))
+		if err != nil {
+			return "", fmt.Errorf("agent: canonicalize trusted context identity: %w", err)
+		}
+		digest := sha256.Sum256(canonicalTrustedContext)
+		trustedContextDigest = hex.EncodeToString(digest[:])
+	}
+	persistent, err := clonePersistentOperationInput(input)
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(struct {
+		RunID            string                 `json:"run_id"`
+		User             string                 `json:"user"`
+		SessionID        string                 `json:"session_id,omitempty"`
+		IdempotencyKey   string                 `json:"idempotency_key,omitempty"`
+		IdempotencyScope string                 `json:"idempotency_scope,omitempty"`
+		Attachments      []ModelInputAttachment `json:"attachments,omitempty"`
+		Metadata         map[string]any         `json:"metadata,omitempty"`
+		TrustedContext   string                 `json:"trusted_context_digest,omitempty"`
+	}{
+		RunID: persistent.RunID, User: persistent.User, SessionID: persistent.SessionID,
+		IdempotencyKey: persistent.IdempotencyKey, IdempotencyScope: persistent.IdempotencyScope,
+		Attachments: persistent.Attachments, Metadata: persistent.Metadata,
+		TrustedContext: trustedContextDigest,
+	})
+	if err != nil {
+		return "", fmt.Errorf("agent: marshal persistent operation input digest: %w", err)
+	}
+	canonicalPayload, err := canonicalJSONIdentity(payload)
+	if err != nil {
+		return "", fmt.Errorf("agent: canonicalize persistent operation input digest: %w", err)
+	}
+	digest := sha256.Sum256(canonicalPayload)
+	return "input_" + hex.EncodeToString(digest[:]), nil
 }
 
 func sessionLeaseFence(handle RunHandle) SessionLeaseFence {
@@ -109,6 +172,10 @@ func (r *Runtime) prepareOperation(input Input, call ToolCall) (preparedOperatio
 	if err != nil {
 		return preparedOperation{}, err
 	}
+	arguments, err = normalizeExactJSONHostValue("normalized operation arguments", arguments)
+	if err != nil {
+		return preparedOperation{}, err
+	}
 	normalizedArguments, err := json.Marshal(arguments)
 	if err != nil {
 		return preparedOperation{}, fmt.Errorf("agent: marshal normalized operation arguments: %w", err)
@@ -136,30 +203,25 @@ func (r *Runtime) failOperationPreparation(run *RunRecord, call ToolCall, cause 
 }
 
 func (r *Runtime) reserveOperationPlan(ctx context.Context, run *RunRecord, input Input, state *agentState, operations []preparedOperation) error {
+	if err := r.assignOperationExecutionIDs(run, input, state, operations); err != nil {
+		return err
+	}
 	steps := make([]OperationPlanStep, 0, len(operations))
 	requestID := operationRequestID(input)
 	batchIndex := state.operationBatchCount
 	firstWrite := -1
 	for i := range operations {
 		if operations[i].operation.Effect != OperationEffectWrite {
-			if operations[i].operation.Terminal {
-				operations[i].executionID = terminalOperationExecutionID(
-					run.ID,
-					operations[i].call.ID,
-					operations[i].call.Name,
-					operations[i].normalizedArguments,
-				)
-			}
 			continue
 		}
 		if firstWrite == -1 {
 			firstWrite = i
 		}
-		stepIndex := uint64(len(steps))
-		operations[i].executionID = operationExecutionID(requestID, batchIndex, stepIndex, operations[i].call.Name, operations[i].normalizedArguments)
+		contractID := operationSummary(operations[i].operation).ContractID
 		steps = append(steps, OperationPlanStep{
 			ExecutionID: operations[i].executionID,
 			Name:        operations[i].call.Name,
+			ContractID:  contractID,
 			Arguments:   append(json.RawMessage(nil), operations[i].normalizedArguments...),
 		})
 	}
@@ -173,13 +235,18 @@ func (r *Runtime) reserveOperationPlan(ctx context.Context, run *RunRecord, inpu
 		IdempotencyKey: input.IdempotencyKey, IdempotencyScope: input.IdempotencyScope,
 		Index: batchIndex, Steps: steps, CreatedAt: r.now(),
 	}
-	reservation, err := r.executions.ReservePlanBatch(ctx, batch)
+	expectedBatch := cloneOperationPlanBatch(batch)
+	reservation, err := r.executions.ReservePlanBatch(ctx, cloneOperationPlanBatch(batch))
 	if err != nil {
-		return r.rejectOperationPlan(ctx, run, operations[firstWrite], batch, fmt.Errorf("agent: reserve operation plan batch %d: %w", batchIndex, err))
+		return r.rejectOperationPlan(ctx, run, operations[firstWrite], expectedBatch, fmt.Errorf("agent: reserve operation plan batch %d: %w", batchIndex, validateUTF8Error("execution store", err)))
 	}
-	if !equalOperationPlanBatch(reservation.Batch, batch) {
+	reservation = PlanBatchReservation{Batch: cloneOperationPlanBatch(reservation.Batch), Created: reservation.Created}
+	if err := validateUTF8Boundary("operation plan reservation", reservation); err != nil {
+		return r.rejectOperationPlan(ctx, run, operations[firstWrite], expectedBatch, err)
+	}
+	if !equalOperationPlanBatch(reservation.Batch, expectedBatch) {
 		cause := fmt.Errorf("%w: request %s batch %d", ErrOperationPlanChanged, requestID, batchIndex)
-		return r.rejectOperationPlan(ctx, run, operations[firstWrite], batch, cause)
+		return r.rejectOperationPlan(ctx, run, operations[firstWrite], expectedBatch, cause)
 	}
 	data, err := json.Marshal(struct {
 		Batch   OperationPlanBatch `json:"batch"`
@@ -188,12 +255,16 @@ func (r *Runtime) reserveOperationPlan(ctx context.Context, run *RunRecord, inpu
 	if err != nil {
 		return correlateOperationError(state.planCallID, state.planExecutionID, "", err)
 	}
+	itemID, err := r.nextGeneratedID(ctx, "operation plan item id")
+	if err != nil {
+		return r.rejectOperationPlan(ctx, run, operations[firstWrite], expectedBatch, err)
+	}
 	if err := r.appendItem(ctx, ItemRecord{
-		ID: r.newID(), RunID: run.ID, SessionID: input.SessionID,
+		ID: itemID, RunID: run.ID, SessionID: input.SessionID,
 		Type: ItemTypeOperationPlan, RequestID: requestID, PlanBatch: batchIndex,
 		CallID: state.planCallID, ExecutionID: state.planExecutionID, Data: data, CreatedAt: r.now(),
 	}); err != nil {
-		return r.rejectOperationPlan(ctx, run, operations[firstWrite], batch, err)
+		return r.rejectOperationPlan(ctx, run, operations[firstWrite], expectedBatch, err)
 	}
 	r.emit(Event{
 		Type: EventOperationPlanReserved, RunID: run.ID, SessionID: input.SessionID,
@@ -201,6 +272,36 @@ func (r *Runtime) reserveOperationPlan(ctx context.Context, run *RunRecord, inpu
 		ExecutionID: state.planExecutionID, Text: planReservationText(reservation.Created), Data: data,
 	})
 	state.operationBatchCount++
+	return nil
+}
+
+func (r *Runtime) assignOperationExecutionIDs(run *RunRecord, input Input, state *agentState, operations []preparedOperation) error {
+	requestID := operationRequestID(input)
+	batchIndex := state.operationBatchCount
+	writeIndex := uint64(0)
+	for index := range operations {
+		contractID := operationSummary(operations[index].operation).ContractID
+		if operations[index].operation.Effect == OperationEffectWrite {
+			executionID, err := operationExecutionID(
+				requestID, batchIndex, writeIndex, operations[index].call.Name, contractID, operations[index].normalizedArguments,
+			)
+			if err != nil {
+				return fmt.Errorf("agent: derive operation execution id for %q: %w", operations[index].call.Name, err)
+			}
+			operations[index].executionID = executionID
+			writeIndex++
+			continue
+		}
+		if operations[index].operation.Terminal {
+			executionID, err := terminalOperationExecutionID(
+				run.ID, operations[index].call.ID, operations[index].call.Name, contractID, operations[index].normalizedArguments,
+			)
+			if err != nil {
+				return fmt.Errorf("agent: derive terminal operation execution id for %q: %w", operations[index].call.Name, err)
+			}
+			operations[index].executionID = executionID
+		}
+	}
 	return nil
 }
 
@@ -215,7 +316,10 @@ func (r *Runtime) sealOperationPlan(ctx context.Context, run *RunRecord, input I
 	}
 	result, err := r.executions.SealPlan(ctx, seal)
 	if err != nil {
-		return r.rejectOperationPlanSeal(ctx, run, state, seal, fmt.Errorf("agent: seal operation plan: %w", err))
+		return r.rejectOperationPlanSeal(ctx, run, state, seal, fmt.Errorf("agent: seal operation plan: %w", validateUTF8Error("execution store", err)))
+	}
+	if err := validateUTF8Boundary("operation plan seal", result); err != nil {
+		return r.rejectOperationPlanSeal(ctx, run, state, seal, err)
 	}
 	if !equalOperationPlanSeal(result.Seal, seal) {
 		cause := fmt.Errorf("%w: request %s seal", ErrOperationPlanChanged, seal.RequestID)
@@ -228,8 +332,12 @@ func (r *Runtime) sealOperationPlan(ctx context.Context, run *RunRecord, input I
 	if err != nil {
 		return correlateOperationError(state.planCallID, state.planExecutionID, "", err)
 	}
+	itemID, err := r.nextGeneratedID(ctx, "operation plan seal item id")
+	if err != nil {
+		return r.rejectOperationPlanSeal(ctx, run, state, seal, err)
+	}
 	if err := r.appendItem(ctx, ItemRecord{
-		ID: r.newID(), RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeOperationPlan,
+		ID: itemID, RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeOperationPlan,
 		RequestID: seal.RequestID, PlanBatch: seal.BatchCount, CallID: state.planCallID,
 		ExecutionID: state.planExecutionID, Data: data, CreatedAt: r.now(),
 	}); err != nil {
@@ -244,16 +352,22 @@ func (r *Runtime) sealOperationPlan(ctx context.Context, run *RunRecord, input I
 }
 
 func (r *Runtime) rejectOperationPlan(ctx context.Context, run *RunRecord, operation preparedOperation, batch OperationPlanBatch, cause error) error {
+	cause = validateUTF8Error("execution store", cause)
 	data, marshalErr := json.Marshal(batch)
 	if marshalErr != nil {
 		cause = errors.Join(cause, marshalErr)
 	}
-	if err := r.appendItem(ctx, ItemRecord{
-		ID: r.newID(), RunID: run.ID, SessionID: batch.SessionID, Type: ItemTypeOperationPlan,
-		RequestID: batch.RequestID, PlanBatch: batch.Index, CallID: operation.call.ID,
-		ExecutionID: operation.executionID, Data: data, Error: cause.Error(), CreatedAt: r.now(),
-	}); err != nil {
-		cause = errors.Join(cause, err)
+	itemID, idErr := r.nextGeneratedID(ctx, "rejected operation plan item id")
+	if idErr != nil {
+		cause = errors.Join(cause, idErr)
+	} else {
+		if err := r.appendItem(ctx, ItemRecord{
+			ID: itemID, RunID: run.ID, SessionID: batch.SessionID, Type: ItemTypeOperationPlan,
+			RequestID: batch.RequestID, PlanBatch: batch.Index, CallID: operation.call.ID,
+			ExecutionID: operation.executionID, Data: data, Error: cause.Error(), CreatedAt: r.now(),
+		}); err != nil {
+			cause = errors.Join(cause, err)
+		}
 	}
 	r.emit(Event{
 		Type: EventOperationPlanRejected, RunID: run.ID, SessionID: batch.SessionID,
@@ -264,16 +378,22 @@ func (r *Runtime) rejectOperationPlan(ctx context.Context, run *RunRecord, opera
 }
 
 func (r *Runtime) rejectOperationPlanSeal(ctx context.Context, run *RunRecord, state *agentState, seal OperationPlanSeal, cause error) error {
+	cause = validateUTF8Error("execution store", cause)
 	data, marshalErr := json.Marshal(seal)
 	if marshalErr != nil {
 		cause = errors.Join(cause, marshalErr)
 	}
-	if err := r.appendItem(ctx, ItemRecord{
-		ID: r.newID(), RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeOperationPlan,
-		RequestID: seal.RequestID, PlanBatch: seal.BatchCount, CallID: state.planCallID,
-		ExecutionID: state.planExecutionID, Data: data, Error: cause.Error(), CreatedAt: r.now(),
-	}); err != nil {
-		cause = errors.Join(cause, err)
+	itemID, idErr := r.nextGeneratedID(ctx, "rejected operation plan seal item id")
+	if idErr != nil {
+		cause = errors.Join(cause, idErr)
+	} else {
+		if err := r.appendItem(ctx, ItemRecord{
+			ID: itemID, RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeOperationPlan,
+			RequestID: seal.RequestID, PlanBatch: seal.BatchCount, CallID: state.planCallID,
+			ExecutionID: state.planExecutionID, Data: data, Error: cause.Error(), CreatedAt: r.now(),
+		}); err != nil {
+			cause = errors.Join(cause, err)
+		}
 	}
 	r.emit(Event{
 		Type: EventOperationPlanRejected, RunID: run.ID, SessionID: run.SessionID,
@@ -295,11 +415,20 @@ func equalOperationPlanBatch(left, right OperationPlanBatch) bool {
 		return false
 	}
 	for i := range left.Steps {
-		if left.Steps[i].ExecutionID != right.Steps[i].ExecutionID || left.Steps[i].Name != right.Steps[i].Name || !jsonSemanticallyEqual(left.Steps[i].Arguments, right.Steps[i].Arguments) {
+		if left.Steps[i].ExecutionID != right.Steps[i].ExecutionID || left.Steps[i].Name != right.Steps[i].Name || left.Steps[i].ContractID != right.Steps[i].ContractID || !jsonSemanticallyEqual(left.Steps[i].Arguments, right.Steps[i].Arguments) {
 			return false
 		}
 	}
 	return true
+}
+
+func cloneOperationPlanBatch(batch OperationPlanBatch) OperationPlanBatch {
+	out := batch
+	out.Steps = append([]OperationPlanStep(nil), batch.Steps...)
+	for index := range out.Steps {
+		out.Steps[index].Arguments = append(json.RawMessage(nil), batch.Steps[index].Arguments...)
+	}
+	return out
 }
 
 func equalOperationPlanSeal(left, right OperationPlanSeal) bool {

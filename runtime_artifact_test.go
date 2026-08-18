@@ -33,7 +33,7 @@ func TestResultArtifactSessionSummaryRequiresBoundedJSONObject(t *testing.T) {
 		if len(summary) > MaxResultArtifactSessionSummaryBytes {
 			t.Fatalf("test summary size=%d", len(summary))
 		}
-		_, err := terminalSessionHistoryItem("call-1", []terminalSessionArtifactProjection{{
+		_, err := terminalSessionHistoryItem("call-1", []TerminalSessionProjection{{
 			Type: "change_set", SessionSummary: summary,
 		}})
 		if err == nil || !strings.Contains(err.Error(), "history exceeds") {
@@ -47,7 +47,7 @@ func TestValidateProjectedFunctionCallSupportsRuntimeModelEnvelopes(t *testing.T
 		name string
 		raw  json.RawMessage
 	}{
-		{name: "native", raw: json.RawMessage(`{"type":"function_call","call_id":"call-1"}`)},
+		{name: "native", raw: json.RawMessage(`{"type":"function_call","call_id":"call-1","name":"finish","arguments":"{}"}`)},
 		{name: "host adapter", raw: json.RawMessage(`{"type":"function_call","call":{"id":"call-1","name":"finish","arguments":{}}}`)},
 	}
 	for _, test := range tests {
@@ -226,7 +226,7 @@ func TestRuntimeRejectsNormalizedOperationInputThatViolatesSchema(t *testing.T) 
 func TestRuntimeCanonicalizesOperationInputBeforePlanIdentity(t *testing.T) {
 	ops := NewOperationRegistry()
 	if err := ops.Register(Operation{
-		Name: "apply_default", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_default", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{
             "type":"object",
             "properties":{"model_key":{"type":["string","null"]}},
@@ -271,8 +271,15 @@ func TestRuntimeCanonicalizesOperationInputBeforePlanIdentity(t *testing.T) {
 		t.Fatalf("arguments were not canonicalized before planning: omitted=%s explicit=%s", omitted.normalizedArguments, explicit.normalizedArguments)
 	}
 	requestID := operationRequestID(input)
-	omittedID := operationExecutionID(requestID, 0, 0, omitted.call.Name, omitted.normalizedArguments)
-	explicitID := operationExecutionID(requestID, 0, 0, explicit.call.Name, explicit.normalizedArguments)
+	contractID := operationSummary(omitted.operation).ContractID
+	omittedID, err := operationExecutionID(requestID, 0, 0, omitted.call.Name, contractID, omitted.normalizedArguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitID, err := operationExecutionID(requestID, 0, 0, explicit.call.Name, contractID, explicit.normalizedArguments)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if omittedID != explicitID {
 		t.Fatalf("semantic defaults produced different execution IDs: omitted=%s explicit=%s", omittedID, explicitID)
 	}
@@ -280,7 +287,7 @@ func TestRuntimeCanonicalizesOperationInputBeforePlanIdentity(t *testing.T) {
 
 func TestOperationRegistryRejectsWriteWithoutConfirmationMode(t *testing.T) {
 	err := NewOperationRegistry().Register(Operation{
-		Name: "apply_change", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_change", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
 	})
 	if err == nil || !strings.Contains(err.Error(), "confirmation mode must be none or required") {
@@ -290,7 +297,7 @@ func TestOperationRegistryRejectsWriteWithoutConfirmationMode(t *testing.T) {
 
 func TestOperationRegistryAllowsConfirmationNoneWriteWithoutApprovalPreview(t *testing.T) {
 	err := NewOperationRegistry().Register(Operation{
-		Name: "apply_change", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_change", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Confirmation: ConfirmationSpec{Mode: ConfirmationNone},
 	})
@@ -301,7 +308,7 @@ func TestOperationRegistryAllowsConfirmationNoneWriteWithoutApprovalPreview(t *t
 
 func TestOperationRegistryRejectsApprovalPreviewOnDirectWrite(t *testing.T) {
 	err := NewOperationRegistry().Register(Operation{
-		Name: "apply_change", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_change", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Confirmation: ConfirmationSpec{Mode: ConfirmationNone},
 		ApprovalPreview: func(any) (json.RawMessage, error) {
@@ -315,7 +322,7 @@ func TestOperationRegistryRejectsApprovalPreviewOnDirectWrite(t *testing.T) {
 
 func TestOperationRegistryRejectsWriteWithoutSafeApprovalPreview(t *testing.T) {
 	err := NewOperationRegistry().Register(Operation{
-		Name: "apply_change", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_change", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Confirmation: ConfirmationSpec{Mode: ConfirmationRequired, Description: "verify the persisted change"},
 	})
@@ -327,7 +334,7 @@ func TestOperationRegistryRejectsWriteWithoutSafeApprovalPreview(t *testing.T) {
 func TestOperationRegistryRejectsEmptyApprovalPreview(t *testing.T) {
 	registry := NewOperationRegistry()
 	err := registry.Register(Operation{
-		Name: "apply_change", Description: "write", Effect: OperationEffectWrite,
+		Name: "apply_change", ContractVersion: "test-v1", Description: "write", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Confirmation:    ConfirmationSpec{Mode: ConfirmationRequired, Description: "verify the persisted change"},
 		ApprovalPreview: func(any) (json.RawMessage, error) { return json.RawMessage(`{}`), nil },

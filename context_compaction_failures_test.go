@@ -11,7 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-func TestRuntimeRejectsCallIDThatWasRemovedByCompaction(t *testing.T) {
+func TestRuntimeAllowsCallIDAfterItsReplayContextWasCompacted(t *testing.T) {
 	counter := &testTokenCounter{
 		countRequest: func(request ModelRequest) (int, error) {
 			if requestHasCheckpoint(request) {
@@ -26,7 +26,8 @@ func TestRuntimeRejectsCallIDThatWasRemovedByCompaction(t *testing.T) {
 	}}
 	model := &scriptedModel{responses: []*ModelResponse{
 		messageResponse("first-response", "done"),
-		callResponse("reused-response", ToolCall{ID: "old-call", Name: "missing", Input: json.RawMessage(`{}`)}),
+		callResponse("reused-response", ToolCall{ID: "old-call", Name: "read_context", Input: json.RawMessage(`{}`)}),
+		messageResponse("second-response", "done again"),
 	}}
 	store := &recordingStore{}
 	seedContextSession(store, "seen-session", []ModelInputItem{
@@ -38,12 +39,15 @@ func TestRuntimeRejectsCallIDThatWasRemovedByCompaction(t *testing.T) {
 	if _, err := runtime.Run(context.Background(), Input{User: "compact", SessionID: "seen-session"}); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	if got := store.sessions["seen-session"].SeenCallIDs; !cmp.Equal(got, []string{"old-call"}) {
-		t.Fatalf("legacy call ids were not rebuilt before compaction: %v", got)
+	if got := store.sessions["seen-session"].SeenCallIDs; len(got) != 0 {
+		t.Fatalf("compacted call ids were retained: %v", got)
 	}
-	_, err := runtime.Run(context.Background(), Input{User: "reuse", SessionID: "seen-session"})
-	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "reused function call id") {
-		t.Fatalf("second Run error=%v", err)
+	result, err := runtime.Run(context.Background(), Input{User: "reuse", SessionID: "seen-session"})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if result.Output != "done again" {
+		t.Fatalf("second output=%q", result.Output)
 	}
 }
 
@@ -312,7 +316,7 @@ func TestRuntimeDoesNotCompactOrphanItemsBeforeFirstUserTurn(t *testing.T) {
 	runtime := newContextRuntimeForTest(t, model, store, contextWindowForTest(counter, compactor), nil)
 
 	_, err := runtime.Run(context.Background(), Input{User: "current", SessionID: "orphan-session"})
-	if !errors.Is(err, ErrContextCompactionFailed) || !strings.Contains(err.Error(), "starts with") {
+	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "starts with") {
 		t.Fatalf("Run error=%v", err)
 	}
 	if len(model.requests) != 0 {
@@ -346,7 +350,7 @@ func TestRuntimeDoesNotSplitFunctionCallAndToolResultAcrossCompactionBoundary(t 
 	runtime := newContextRuntimeForTest(t, model, store, window, nil)
 
 	_, err := runtime.Run(context.Background(), Input{User: "current", SessionID: "split-call-session"})
-	if !errors.Is(err, ErrContextCompactionFailed) || !strings.Contains(err.Error(), "missing results before user message") {
+	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "missing results before user message") {
 		t.Fatalf("Run error=%v", err)
 	}
 	if len(model.requests) != 0 {
@@ -397,7 +401,7 @@ func TestRuntimeRejectsMismatchedToolCallIDsBeforeCompaction(t *testing.T) {
 	runtime := newContextRuntimeForTest(t, model, store, contextWindowForTest(counter, compactor), nil)
 
 	_, err := runtime.Run(context.Background(), Input{User: "current", SessionID: "mismatched-call-session"})
-	if !errors.Is(err, ErrContextCompactionFailed) || !strings.Contains(err.Error(), `references call ID "call-b", pending call IDs are [call-a]`) {
+	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), `references call ID "call-b", pending call IDs are [call-a]`) {
 		t.Fatalf("Run error=%v", err)
 	}
 	if len(compactor.requests) != 0 {

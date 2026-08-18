@@ -18,3 +18,31 @@ jobs:
           cache: true
       - run: go test ./...
       - run: go vet ./...
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go test -race ./...
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, freebsd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Compile tests for ${{ matrix.goos }}/amd64
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+        run: go test -exec=true ./...

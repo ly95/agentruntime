@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func TestOpenAIModelEmitsStructuredErrorChunks(t *testing.T) {
 		},
 		{
 			name:         "provider error",
-			payload:      "data: {\"type\":\"error\",\"sequence_number\":2,\"code\":\"bad_request\",\"message\":\"boom\"}\n\n",
+			payload:      "data: {\"type\":\"error\",\"sequence_number\":2,\"code\":\"bad_request\",\"message\":\"boom\",\"param\":\"request\"}\n\n",
 			providerType: "error", code: "bad_request", hasSequence: true,
 		},
 		{
@@ -195,6 +196,25 @@ func TestParseOpenAIResponsePreservesNativeOutputItems(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIResponseRejectsDuplicateOutputItemIDs(t *testing.T) {
+	var raw responses.Response
+	if err := json.Unmarshal([]byte(`{
+		"id":"resp_duplicate_items",
+		"status":"completed",
+		"output":[
+			{"id":"msg_duplicate","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"one","annotations":[]}]},
+			{"id":"msg_duplicate","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"two","annotations":[]}]}
+		],
+		"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
+	}`), &raw); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	_, err := parseOpenAIResponse(&raw)
+	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "repeats output item id") {
+		t.Fatalf("parseOpenAIResponse error=%v, want duplicate item rejection", err)
+	}
+}
+
 func TestParseOpenAIResponseExcludesCommentaryFromFinalOutput(t *testing.T) {
 	var raw responses.Response
 	if err := json.Unmarshal([]byte(`{
@@ -261,7 +281,8 @@ func TestBuildOpenAIInputItemsReplaysFunctionCallBeforeToolResult(t *testing.T) 
 		{Type: ModelInputUserMessage, Text: "remember red"},
 		{
 			Type: ModelInputAssistantOutput, OutputType: ModelOutputFunctionCall,
-			Raw: json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_1","name":"memory_put","arguments":"{\"key\":\"color\",\"value\":\"red\"}","status":"completed"}`),
+			CallID: "call_1",
+			Raw:    json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_1","name":"memory_put","arguments":"{\"key\":\"color\",\"value\":\"red\"}","status":"completed"}`),
 		},
 		{Type: ModelInputToolResult, CallID: "call_1", Output: json.RawMessage(`{"stored":true}`)},
 	})
@@ -273,6 +294,30 @@ func TestBuildOpenAIInputItemsReplaysFunctionCallBeforeToolResult(t *testing.T) 
 	}
 	if items[1].OfFunctionCall.CallID != "call_1" || items[2].OfFunctionCallOutput.CallID != "call_1" {
 		t.Fatalf("function call replay=%+v result=%+v", items[1], items[2])
+	}
+}
+
+func TestBuildOpenAIInputItemsRejectsNoncanonicalFunctionIdentities(t *testing.T) {
+	for name, items := range map[string][]ModelInputItem{
+		"assistant call id": {
+			{Type: ModelInputUserMessage, Text: "remember red"},
+			{Type: ModelInputAssistantOutput, OutputType: ModelOutputFunctionCall, CallID: " call_1 ", Raw: json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_1","name":"memory_put","arguments":"{}","status":"completed"}`)},
+		},
+		"raw call name": {
+			{Type: ModelInputUserMessage, Text: "remember red"},
+			{Type: ModelInputAssistantOutput, OutputType: ModelOutputFunctionCall, CallID: "call_1", Raw: json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_1","name":" memory_put ","arguments":"{}","status":"completed"}`)},
+		},
+		"tool result call id": {
+			{Type: ModelInputUserMessage, Text: "remember red"},
+			{Type: ModelInputAssistantOutput, OutputType: ModelOutputFunctionCall, CallID: "call_1", Raw: json.RawMessage(`{"id":"fc_1","type":"function_call","call_id":"call_1","name":"memory_put","arguments":"{}","status":"completed"}`)},
+			{Type: ModelInputToolResult, CallID: " call_1 ", Output: json.RawMessage(`{}`)},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := buildOpenAIInputItems(items); err == nil {
+				t.Fatal("OpenAI replay accepted noncanonical function identity")
+			}
+		})
 	}
 }
 
@@ -404,5 +449,30 @@ func TestToolDefinitionsIDUsesUnambiguousFieldEncoding(t *testing.T) {
 	}})
 	if left == right {
 		t.Fatalf("distinct tool definitions produced the same ID: %s", left)
+	}
+}
+
+func TestToolDefinitionsIDEncodesCollectionAndToolBoundaries(t *testing.T) {
+	left := []ToolDefinition{
+		{Name: "a", PreviousNames: []string{"b"}, Description: "{}", InputSchema: json.RawMessage(`{}`)},
+		{Name: "e", Description: "f", InputSchema: json.RawMessage(`{}`)},
+	}
+	right := []ToolDefinition{
+		{Name: "a", Description: "b", InputSchema: json.RawMessage(`{}`)},
+		{Name: "{}", PreviousNames: []string{"e"}, Description: "f", InputSchema: json.RawMessage(`{}`)},
+	}
+	if leftID, rightID := toolDefinitionsID(left), toolDefinitionsID(right); leftID == rightID {
+		t.Fatalf("structurally distinct tool collections produced the same ID: %s", leftID)
+	}
+
+	model := &OpenAIModel{toolCache: make(map[string][]responses.ToolUnionParam)}
+	if _, err := model.cachedOpenAITools("", left); err != nil {
+		t.Fatalf("cache left tools: %v", err)
+	}
+	if _, err := model.cachedOpenAITools("", right); err != nil {
+		t.Fatalf("cache right tools: %v", err)
+	}
+	if len(model.toolCache) != 2 {
+		t.Fatalf("tool cache entries=%d, want two structurally distinct snapshots", len(model.toolCache))
 	}
 }

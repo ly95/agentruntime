@@ -77,6 +77,10 @@ func (local *localMCP) handleTool(
 		return nil, err
 	}
 	result, executeErr := local.executor.Execute(ctx, invocation.request)
+	executeErr = validateUTF8Error("operation executor", executeErr)
+	if executeErr == nil {
+		executeErr = validateUTF8Boundary("operation result", result)
+	}
 	local.completeInvocation(token, result, executeErr)
 	if executeErr != nil {
 		return encodeMCPError(executeErr)

@@ -9,7 +9,10 @@ import (
 // OperationReconciler settles persisted operation executions without creating
 // a model adapter or starting an Agent Run. Hosts use it before credentials,
 // attachments, runtime-version checks, and terminal Run handling so an
-// unresolved write cannot be stranded by unrelated conversation state.
+// unresolved write cannot be stranded by unrelated conversation state. The
+// evidence-bearing abandon action is only for a started attempt whose executor
+// is independently proved not to have begun; evidence-bearing completion can
+// settle the exact started attempt when the executor is proved to have committed.
 type OperationReconciler struct {
 	runtime *Runtime
 }
@@ -22,10 +25,11 @@ func NewOperationReconciler(
 		return nil, errors.New("agent: operation registry and execution store are required for reconciliation")
 	}
 	return &OperationReconciler{runtime: &Runtime{
-		operations: operations,
-		executions: executions,
-		newID:      randomID,
-		now:        time.Now,
+		operations:     operations,
+		executions:     executions,
+		newID:          randomID,
+		now:            time.Now,
+		cleanupTimeout: defaultDetachedCleanupTimeout,
 	}}, nil
 }
 

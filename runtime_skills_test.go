@@ -367,11 +367,8 @@ func TestRuntimeRejectsMissingBeginRunSkillBinding(t *testing.T) {
 	if !errors.Is(err, ErrSessionConflict) || len(model.requests) != 0 {
 		t.Fatalf("error=%v requests=%d", err, len(model.requests))
 	}
-	if binding := store.sessions["hidden-binding-session"]; binding.SkillSetID != set.ID() || binding.Revision != 0 {
-		t.Fatalf("persisted binding=%+v", binding)
-	}
-	if _, leased := store.leases["hidden-binding-session"]; leased {
-		t.Fatal("invalid BeginRun result retained a lease")
+	if len(store.runs) != 0 || len(store.sessions) != 0 || len(store.leases) != 0 || len(store.leaseGenerations) != 0 {
+		t.Fatalf("rejected pre-commit binding mutated store: runs=%+v sessions=%+v leases=%+v generations=%+v", store.runs, store.sessions, store.leases, store.leaseGenerations)
 	}
 }
 
@@ -380,7 +377,7 @@ func TestRunStoreRejectsFinishRunSkillBindingRewrite(t *testing.T) {
 		"binding-session": {ID: "binding-session", SkillSetID: "set-a"},
 	}}
 	run := RunRecord{ID: "binding-run", SessionID: "binding-session", SkillSetID: "set-a", Status: RunStatusRunning}
-	begun, err := store.BeginRun(t.Context(), BeginRunRequest{Run: run, LeaseID: "binding-lease", LeaseTTL: defaultSessionLeaseTTL})
+	begun, err := createRunForTest(t.Context(), store, CreateRunRequest{Run: run, LeaseID: "binding-lease", LeaseTTL: defaultSessionLeaseTTL})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +498,7 @@ func TestRuntimeAnchorsSkillSetAcrossApprovalPauseAndResume(t *testing.T) {
 	}
 }
 
-func TestRuntimeTreatsLegacyApprovalBindingAsEmptyBeforeClaim(t *testing.T) {
+func TestRuntimeRejectsUnanchoredLegacyApprovalBeforeBindingClaim(t *testing.T) {
 	set, _ := oneRuntimeSkill(t, "new-skill", "NEW_SKILL_BODY")
 	input := Input{RunID: "legacy-waiting-run", SessionID: "legacy-waiting-session", User: "poll approval"}
 	store := &recordingStore{runs: []RunRecord{{
@@ -532,12 +529,21 @@ func TestRuntimeTreatsLegacyApprovalBindingAsEmptyBeforeClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := correct.Run(t.Context(), input)
-	if err != nil || result.Status != RunStatusWaitingUser {
-		t.Fatalf("legacy empty binding resume result=%+v error=%v", result, err)
+	if !errors.Is(err, ErrOperationPlanChanged) || result != nil {
+		t.Fatalf("unanchored legacy approval result=%+v error=%v", result, err)
+	}
+	store.mu.Lock()
+	after := store.runs[0]
+	_, leased := store.leases[input.SessionID]
+	generation := store.leaseGenerations[input.SessionID]
+	_, rebound = store.sessions[input.SessionID]
+	store.mu.Unlock()
+	if after.Status != RunStatusWaitingUser || after.PendingApprovalDigest != "" || leased || generation != 0 || rebound {
+		t.Fatalf("unanchored legacy resume mutated state: run=%+v leased=%v generation=%d rebound=%v", after, leased, generation, rebound)
 	}
 }
 
-func TestRuntimeWithoutSkillsPreservesApprovalWaitPersistenceShape(t *testing.T) {
+func TestRuntimeWithoutSkillsPersistsOperationBindingWhileWaiting(t *testing.T) {
 	model := &scriptedModel{responses: []*ModelResponse{
 		callResponse("no-skill-approval", ToolCall{ID: "call-1", Name: "apply_change", Input: json.RawMessage(`{}`)}),
 	}}
@@ -572,16 +578,21 @@ func TestRuntimeWithoutSkillsPreservesApprovalWaitPersistenceShape(t *testing.T)
 	if len(store.requests) != 2 {
 		t.Fatalf("FinishRun requests=%d, want 2", len(store.requests))
 	}
-	for index, request := range store.requests {
-		if request.Session != nil {
-			t.Fatalf("FinishRun request %d persisted disabled Skill state: %+v", index, request.Session)
-		}
+	if first := store.requests[0].Session; first == nil || first.SkillSetID != "" || first.OperationSetID == "" {
+		t.Fatalf("initial FinishRun operation binding=%+v", first)
+	}
+	if polled := store.requests[1].Session; polled != nil {
+		t.Fatalf("pending poll advanced the approval-bound session: %+v", polled)
 	}
 	store.mu.Lock()
-	_, persisted := store.sessions[input.SessionID]
+	persistedSession, persisted := store.sessions[input.SessionID]
+	pending := store.pendingApprovals[input.RunID]
 	store.mu.Unlock()
-	if persisted {
-		t.Fatal("no-Skill approval polling created a SessionState")
+	if !persisted {
+		t.Fatal("approval polling did not preserve the operation-set binding")
+	}
+	if pending.Request.Checkpoint == nil || pending.Request.Checkpoint.ExpectedSessionRevision != persistedSession.Revision {
+		t.Fatalf("pending revision=%+v session revision=%d", pending.Request.Checkpoint, persistedSession.Revision)
 	}
 }
 

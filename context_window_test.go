@@ -56,7 +56,7 @@ func newContextRuntimeForTest(t *testing.T, model Model, store RunStore, window 
 	if err := operations.Register(operation("read_context", OperationEffectRead)); err != nil {
 		t.Fatalf("Register operation: %v", err)
 	}
-	runtime, err := NewRuntime(RuntimeConfig{
+	config := RuntimeConfig{
 		Model: model, RunStore: store, Operations: operations,
 		Policy: allowPolicy(), Executor: OperationExecutorFunc(
 			func(context.Context, OperationRequest) (OperationResult, error) {
@@ -64,9 +64,12 @@ func newContextRuntimeForTest(t *testing.T, model Model, store RunStore, window 
 			},
 		),
 		ContextWindow: window, EventSink: sink,
-		Now:   func() time.Time { return time.Unix(100, 0).UTC() },
-		NewID: func() string { nextID++; return "context-id-" + string(rune('a'+nextID)) },
-	})
+		Now: func() time.Time { return time.Unix(100, 0).UTC() },
+	}
+	if store != nil {
+		config.NewID = func() string { nextID++; return "context-id-" + string(rune('a'+nextID)) }
+	}
+	runtime, err := NewRuntime(config)
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}

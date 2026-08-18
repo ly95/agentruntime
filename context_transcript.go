@@ -6,6 +6,18 @@ import (
 	"fmt"
 )
 
+func transcriptCallIDs(transcript []ModelInputItem) map[string]struct{} {
+	callIDs := make(map[string]struct{})
+	for _, item := range transcript {
+		if item.Type == ModelInputAssistantOutput && item.OutputType == ModelOutputFunctionCall {
+			if item.CallID != "" {
+				callIDs[item.CallID] = struct{}{}
+			}
+		}
+	}
+	return callIDs
+}
+
 func materializeModelInputAttachments(ctx context.Context, resolver ImageAttachmentResolver, transcript []ModelInputItem) ([]ModelInputItem, error) {
 	hasImages := false
 	for _, item := range transcript {
@@ -49,6 +61,7 @@ func materializeModelInputAttachments(ctx context.Context, resolver ImageAttachm
 
 			materialized, err := resolver.ResolveImageAttachment(ctx, attachment)
 			if err != nil {
+				err = validateUTF8Error("image attachment resolver", err)
 				if errors.Is(err, ErrImageAttachmentUnavailable) && !attachment.CurrentRun {
 					// FALLBACK: justified because confirmed-expired or deleted historical
 					// image bytes cannot be reconstructed. An explicit ordered text part
@@ -57,6 +70,9 @@ func materializeModelInputAttachments(ctx context.Context, resolver ImageAttachm
 					continue
 				}
 				return nil, fmt.Errorf("agent: resolve input item %d image attachment %d: %w", itemIndex, attachmentIndex, err)
+			}
+			if err := validateUTF8Boundary("resolved image attachment", materialized); err != nil {
+				return nil, err
 			}
 			materialized = NormalizeModelInputAttachment(materialized)
 			if materialized.ID != attachment.ID || materialized.Filename != attachment.Filename || materialized.MIMEType != attachment.MIMEType {
@@ -110,11 +126,20 @@ func contextCompactionPrefixEnd(transcript []ModelInputItem, preserveRecentTurns
 }
 
 func validateContextTranscriptToolSequences(transcript []ModelInputItem) error {
+	return validateContextTranscriptToolSequencesWithPending(transcript, nil)
+}
+
+func validateContextTranscriptToolSequencesWithPending(transcript []ModelInputItem, allowedPending map[string]struct{}) error {
 	if len(transcript) == 0 {
 		return errors.New("transcript is empty")
 	}
 	if transcript[0].Type != ModelInputUserMessage {
 		return fmt.Errorf("transcript starts with %q instead of a user message", transcript[0].Type)
+	}
+	for callID := range allowedPending {
+		if err := requireCanonicalIdentity(callID, "allowed pending function call id"); err != nil {
+			return err
+		}
 	}
 	pendingCallIDs := make(map[string]struct{})
 	seenCallIDs := make(map[string]struct{})
@@ -129,8 +154,8 @@ func validateContextTranscriptToolSequences(transcript []ModelInputItem) error {
 			}
 		case ModelInputAssistantOutput:
 			if item.OutputType == ModelOutputFunctionCall {
-				if item.CallID == "" {
-					return fmt.Errorf("function call at transcript index %d has an empty call ID", i)
+				if err := requireCanonicalIdentity(item.CallID, "function call id"); err != nil {
+					return fmt.Errorf("function call at transcript index %d: %w", i, err)
 				}
 				if _, exists := seenCallIDs[item.CallID]; exists {
 					return fmt.Errorf("function call at transcript index %d repeats call ID %q", i, item.CallID)
@@ -139,8 +164,8 @@ func validateContextTranscriptToolSequences(transcript []ModelInputItem) error {
 				pendingCallIDs[item.CallID] = struct{}{}
 			}
 		case ModelInputToolResult:
-			if item.CallID == "" {
-				return fmt.Errorf("tool result at transcript index %d has an empty call ID", i)
+			if err := requireCanonicalIdentity(item.CallID, "tool result call id"); err != nil {
+				return fmt.Errorf("tool result at transcript index %d: %w", i, err)
 			}
 			if _, exists := pendingCallIDs[item.CallID]; !exists {
 				return fmt.Errorf(
@@ -153,13 +178,19 @@ func validateContextTranscriptToolSequences(transcript []ModelInputItem) error {
 			return fmt.Errorf("unsupported transcript item type %q at index %d", item.Type, i)
 		}
 	}
-	if len(pendingCallIDs) != 0 {
+	if len(pendingCallIDs) != len(allowedPending) {
 		return fmt.Errorf("tool calls %v are missing results at the end of the transcript", sortedCallIDs(pendingCallIDs))
+	}
+	for callID := range pendingCallIDs {
+		if _, ok := allowedPending[callID]; !ok {
+			return fmt.Errorf("tool call %q is unexpectedly missing its result at the end of the transcript", callID)
+		}
 	}
 	return nil
 }
 
 func (r *Runtime) failContextCompaction(run *RunRecord, inputTokens, compactedItems int, cause error) error {
+	cause = validateUTF8Error("context dependency", cause)
 	r.emit(Event{
 		Type: EventContextCompactionFailed, RunID: run.ID, SessionID: run.SessionID,
 		InputTokens: inputTokens, CompactedItems: compactedItems,

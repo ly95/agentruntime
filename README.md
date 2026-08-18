@@ -54,7 +54,9 @@ flowchart LR
 MCP discovery only exposes operation contracts to the model; it never grants
 permission. Every operation is evaluated by host policy before execution. A
 confirmation-required write cannot complete successfully without a positive
-verifier result.
+verifier result carrying non-empty, non-`null`, unambiguous JSON evidence. The
+same evidence requirement applies to normal completion, durable replay, store
+transition acknowledgements, and reconciliation.
 
 | Runtime owns | Host application owns |
 | --- | --- |
@@ -146,7 +148,7 @@ The `skills` package loads every source through the same `SKILL.md` parser,
 copies all files into an immutable snapshot, and derives deterministic Skill and
 SkillSet hashes. A Runtime freezes the mounted SkillSet at construction and
 adds only each Skill's name, description, and `SKILL.md` body to model
-instructions. For a new Skill-enabled session, `RunStore.BeginRun` atomically
+instructions. For a new Skill-enabled session, `RunStore.CreateRunV3` atomically
 creates a revision-zero binding state before the first transcript snapshot can
 exist; later snapshots retain that SkillSet ID. Implementations must compare the
 incoming `RunRecord.SkillSetID` with stored session, waiting-run, and active-run
@@ -228,11 +230,45 @@ The runtime validates required dependencies when it is constructed:
 | Any write operation | `ExecutionStore` in addition to policy and executor |
 | `ConfirmationRequired` operation | `ResultVerifier`; approval flows also use `Approver` and `ApprovalResumer` |
 | Stateful session | `RunStore` |
+| Custom `NewID` or explicit `Input.RunID` | `RunStore` as durable identity authority |
 
-Hosts should use stable, tenant-scoped idempotency keys for retried requests,
-build approval previews that reveal only safe structured data, and implement the
-execution-attempt fence atomically with the external write. Reconcile unresolved
-write records before allowing unrelated conversation state to hide them.
+Run identity, approval authority, and operation contracts are versioned and
+bound to durable state; the authoritative rules live in the corresponding
+interface and configuration documentation (`store.go`, `operation_registry.go`,
+`runtime_config.go`, `openai_transport.go`). In summary:
+
+- **Run identity**: generated RunIDs only request creation and must collide with
+  every existing run; an explicit `Input.RunID` may resume the exact waiting run.
+  `RunStore` adopts the split `CreateRunV3`/`ResumeRunV3` methods and a
+  synchronous, exactly-once, pre-commit acceptance callback; only an exact
+  `ErrRunNotFound` selects the explicit-ID create fallback. A runtime without a
+  `RunStore` uses the built-in random factory and rejects custom `NewID`.
+- **Reconciliation evidence**: a started attempt may only be abandoned with
+  durable JSON evidence proving the executor never began, or completed with
+  evidence proving it committed; the store fences that exact attempt atomically.
+- **Operation contracts**: every write operation declares a stable
+  `ContractVersion`; Runtime binds the resulting contract digest to sessions,
+  plans, executions, reconciliation, and approval resume state, and fails
+  explicitly on any mismatch. Terminal writes declare their session projection
+  via `ProjectTerminalSession` before execution.
+- **Approval resume**: `RunStore` must round-trip the complete authority-version-1
+  `PendingApprovalCommit` (request, decision, audit, normalized arguments,
+  operation summary, input, checkpoint, and replay) with its digest; pre-versioned
+  subset digests are not resumable. Resume is rejected when the session revision
+  advanced past the checkpoint.
+- **Model output authority**: `OpenAIModel` enforces one ordered
+  `response.created`→`response.completed` lifecycle with strictly increasing
+  sequence numbers, exactly-once item add/finalize/complete, argument-delta
+  reconciliation against `arguments.done` and the completed response, immutable
+  response-field drift detection, and full replay validation before emitting
+  observer-visible completion. Missing, repeated, out-of-order, unsupported, or
+  contradictory evidence fails as invalid model output. Only function tools are
+  offered to the provider, so tool-call lifecycles for other tool classes
+  (web search, code interpreter, MCP, file search, image generation, custom
+  tools) are rejected as invalid model output.
+- **Inputs and bounds**: `Input.IdempotencyScope` is trusted host state, ignored
+  by JSON decoding. `RuntimeConfig.MaxCallsPerTurn` bounds one response's
+  operation fanout (default 32).
 
 ## Examples
 

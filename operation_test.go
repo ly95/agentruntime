@@ -2,6 +2,7 @@ package agentruntime
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -132,11 +133,12 @@ func TestOperationRegistryValidatesTerminalBatchLimit(t *testing.T) {
 			}
 		}
 		return Operation{
-			Name: "proposal", Description: "proposal", Effect: effect,
+			Name: "proposal", ContractVersion: "test-v1", Description: "proposal", Effect: effect,
 			InputSchema:  json.RawMessage(`{"type":"object"}`),
 			OutputSchema: json.RawMessage(`{"type":"object"}`),
 			Confirmation: confirmation, ApprovalPreview: preview,
-			Terminal: terminal, TerminalBatchLimit: limit,
+			ProjectTerminalSession: func(any) ([]TerminalSessionProjection, error) { return nil, nil },
+			Terminal:               terminal, TerminalBatchLimit: limit,
 		}
 	}
 
@@ -163,5 +165,44 @@ func TestOperationRegistryValidatesTerminalBatchLimit(t *testing.T) {
 		if err := NewOperationRegistry().Register(operation); err == nil {
 			t.Fatalf("Register %s unexpectedly succeeded", name)
 		}
+	}
+}
+
+func TestOperationRegistryRequiresTerminalWriteProjection(t *testing.T) {
+	operation := operation("finish", OperationEffectWrite)
+	operation.Terminal = true
+	operation.ProjectTerminalSession = nil
+	if err := NewOperationRegistry().Register(operation); err == nil || !strings.Contains(err.Error(), "requires a session projection") {
+		t.Fatalf("Register error=%v, want explicit terminal projection requirement", err)
+	}
+}
+
+func TestOperationSummaryPublishesTheDescriptionUsedByContractIdentity(t *testing.T) {
+	register := func(t *testing.T, description string) OperationSummary {
+		t.Helper()
+		registry := NewOperationRegistry()
+		op := operation("read_context", OperationEffectRead)
+		op.Description = description
+		if err := registry.Register(op); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		summaries := registry.Summaries()
+		if len(summaries) != 1 {
+			t.Fatalf("summaries=%+v", summaries)
+		}
+		return summaries[0]
+	}
+
+	canonical := register(t, "Read current state")
+	padded := register(t, "  Read current state\t")
+	if padded.Description != canonical.Description || padded.Description != "Read current state" {
+		t.Fatalf("published descriptions differ: canonical=%q padded=%q", canonical.Description, padded.Description)
+	}
+	if padded.ContractID != canonical.ContractID {
+		t.Fatalf("equivalent published contracts have different ids: %q != %q", padded.ContractID, canonical.ContractID)
+	}
+	changed := register(t, "Read historical state")
+	if changed.ContractID == canonical.ContractID {
+		t.Fatalf("substantive description change retained contract id %q", canonical.ContractID)
 	}
 }
