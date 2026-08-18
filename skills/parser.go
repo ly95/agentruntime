@@ -8,12 +8,22 @@ import (
 	"io"
 	"io/fs"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
+
+const (
+	maxSkillNameBytes            = 64
+	maxSkillDescriptionRunes     = 1024
+	maxSkillFrontmatterYAMLNodes = 1024
+)
+
+var skillNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 type skillFrontmatter struct {
 	Name        string `yaml:"name"`
@@ -576,23 +586,147 @@ func parseSkillMarkdown(markdown []byte) (skillFrontmatter, string, error) {
 	if frontmatterEnd < 0 {
 		return skillFrontmatter{}, "", fmt.Errorf("%w: YAML frontmatter closing delimiter is required", ErrInvalidSkill)
 	}
-	var metadata skillFrontmatter
-	if err := yaml.Unmarshal([]byte(content[frontmatterStart:frontmatterEnd]), &metadata); err != nil {
-		return skillFrontmatter{}, "", fmt.Errorf("%w: invalid YAML frontmatter: %v", ErrInvalidSkill, err)
-	}
-	metadata.Name = strings.TrimSpace(metadata.Name)
-	metadata.Description = strings.TrimSpace(metadata.Description)
-	if metadata.Name == "" {
-		return skillFrontmatter{}, "", fmt.Errorf("%w: name is required", ErrInvalidSkill)
-	}
-	if metadata.Description == "" {
-		return skillFrontmatter{}, "", fmt.Errorf("%w: description is required", ErrInvalidSkill)
+	metadata, err := parseSkillFrontmatter([]byte(content[frontmatterStart:frontmatterEnd]))
+	if err != nil {
+		return skillFrontmatter{}, "", err
 	}
 	instructions := strings.TrimSpace(content[bodyStart:])
 	if instructions == "" {
 		return skillFrontmatter{}, "", fmt.Errorf("%w: Markdown body is required", ErrInvalidSkill)
 	}
 	return metadata, instructions, nil
+}
+
+func parseSkillFrontmatter(raw []byte) (skillFrontmatter, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		return skillFrontmatter{}, fmt.Errorf("%w: invalid YAML frontmatter: %v", ErrInvalidSkill, err)
+	}
+	remaining := maxSkillFrontmatterYAMLNodes
+	if err := inspectSkillYAMLNode(&document, &remaining); err != nil {
+		return skillFrontmatter{}, err
+	}
+	mapping, err := skillFrontmatterMapping(&document)
+	if err != nil {
+		return skillFrontmatter{}, err
+	}
+	var metadata skillFrontmatter
+	seen := make(map[string]struct{}, 2)
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		keyNode := mapping.Content[index]
+		valueNode := mapping.Content[index+1]
+		if keyNode == nil || keyNode.Kind != yaml.ScalarNode {
+			return skillFrontmatter{}, fmt.Errorf("%w: YAML frontmatter keys must be strings", ErrInvalidSkill)
+		}
+		key := strings.TrimSpace(keyNode.Value)
+		if key == "<<" || keyNode.Tag == "!!merge" {
+			return skillFrontmatter{}, fmt.Errorf("%w: YAML merge keys are not allowed", ErrInvalidSkill)
+		}
+		if key != "name" && key != "description" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			return skillFrontmatter{}, fmt.Errorf("%w: duplicate %s", ErrInvalidSkill, key)
+		}
+		seen[key] = struct{}{}
+		value, err := skillFrontmatterScalar(valueNode, key)
+		if err != nil {
+			return skillFrontmatter{}, err
+		}
+		switch key {
+		case "name":
+			metadata.Name = value
+		case "description":
+			metadata.Description = value
+		}
+	}
+	if metadata.Name == "" {
+		return skillFrontmatter{}, fmt.Errorf("%w: name is required", ErrInvalidSkill)
+	}
+	if metadata.Description == "" {
+		return skillFrontmatter{}, fmt.Errorf("%w: description is required", ErrInvalidSkill)
+	}
+	if err := validateSkillName(metadata.Name); err != nil {
+		return skillFrontmatter{}, err
+	}
+	if err := validateSkillDescription(metadata.Description); err != nil {
+		return skillFrontmatter{}, err
+	}
+	return metadata, nil
+}
+
+func inspectSkillYAMLNode(node *yaml.Node, remaining *int) error {
+	if node == nil {
+		return fmt.Errorf("%w: YAML frontmatter contains a nil node", ErrInvalidSkill)
+	}
+	if *remaining <= 0 {
+		return fmt.Errorf("%w: YAML frontmatter exceeds %d nodes", ErrLimitExceeded, maxSkillFrontmatterYAMLNodes)
+	}
+	*remaining--
+	if node.Kind == yaml.AliasNode {
+		return fmt.Errorf("%w: YAML aliases are not allowed", ErrInvalidSkill)
+	}
+	if node.Tag == "!!merge" || node.Tag == "!!binary" {
+		return fmt.Errorf("%w: YAML tag %s is not allowed", ErrInvalidSkill, node.Tag)
+	}
+	for _, child := range node.Content {
+		if err := inspectSkillYAMLNode(child, remaining); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func skillFrontmatterMapping(document *yaml.Node) (*yaml.Node, error) {
+	if document == nil || document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0] == nil {
+		return nil, fmt.Errorf("%w: YAML frontmatter must be a mapping", ErrInvalidSkill)
+	}
+	mapping := document.Content[0]
+	if mapping.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("%w: YAML frontmatter must be a mapping", ErrInvalidSkill)
+	}
+	if len(mapping.Content)%2 != 0 {
+		return nil, fmt.Errorf("%w: YAML frontmatter mapping is malformed", ErrInvalidSkill)
+	}
+	return mapping, nil
+}
+
+func skillFrontmatterScalar(node *yaml.Node, field string) (string, error) {
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return "", fmt.Errorf("%w: %s must be a string", ErrInvalidSkill, field)
+	}
+	switch node.Tag {
+	case "", "!", "!!str":
+	default:
+		return "", fmt.Errorf("%w: %s must be a string", ErrInvalidSkill, field)
+	}
+	value := strings.TrimSpace(node.Value)
+	if value == "" {
+		return "", fmt.Errorf("%w: %s is required", ErrInvalidSkill, field)
+	}
+	return value, nil
+}
+
+func validateSkillName(name string) error {
+	if len(name) > maxSkillNameBytes || !skillNamePattern.MatchString(name) {
+		return fmt.Errorf("%w: name must be 1-%d lowercase alphanumeric kebab-case characters", ErrInvalidSkill, maxSkillNameBytes)
+	}
+	return nil
+}
+
+func validateSkillDescription(description string) error {
+	if !utf8.ValidString(description) {
+		return fmt.Errorf("%w: description must be valid UTF-8", ErrInvalidSkill)
+	}
+	for _, character := range description {
+		if unicode.IsControl(character) && character != '\t' && character != '\n' && character != '\r' {
+			return fmt.Errorf("%w: description must not contain control characters", ErrInvalidSkill)
+		}
+	}
+	if utf8.RuneCountInString(description) > maxSkillDescriptionRunes {
+		return fmt.Errorf("%w: description exceeds %d characters", ErrInvalidSkill, maxSkillDescriptionRunes)
+	}
+	return nil
 }
 
 func digestSkill(skill Skill) string {

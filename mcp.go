@@ -90,19 +90,23 @@ func newLocalMCP(
 }
 
 func (local *localMCP) registerTool(operation OperationSummary) {
-	readOnly := operation.Effect == OperationEffectRead
-	destructive := operation.Effect == OperationEffectWrite
 	local.server.AddTool(&mcpsdk.Tool{
 		Name:         operation.Name,
 		Description:  operationToolDescription(operation),
 		InputSchema:  append(json.RawMessage(nil), operation.InputSchema...),
 		OutputSchema: append(json.RawMessage(nil), operation.OutputSchema...),
-		Annotations: &mcpsdk.ToolAnnotations{
-			ReadOnlyHint:    readOnly,
-			DestructiveHint: &destructive,
-			IdempotentHint:  true,
-		},
+		Annotations:  operationMCPAnnotations(operation),
 	}, local.handleTool)
+}
+
+func operationMCPAnnotations(operation OperationSummary) *mcpsdk.ToolAnnotations {
+	readOnly := operation.Effect == OperationEffectRead
+	destructive := operation.Effect == OperationEffectWrite
+	return &mcpsdk.ToolAnnotations{
+		ReadOnlyHint:    readOnly,
+		DestructiveHint: &destructive,
+		IdempotentHint:  readOnly,
+	}
 }
 
 func (local *localMCP) discover(
@@ -253,11 +257,12 @@ func validateDiscoveredTool(
 			"agent: MCP tool %q contract differs from host policy", tool.Name,
 		)
 	}
-	if tool.Annotations == nil ||
-		tool.Annotations.ReadOnlyHint != (operation.Effect == OperationEffectRead) ||
+	expected := operationMCPAnnotations(operation)
+	if tool.Annotations == nil || expected == nil || expected.DestructiveHint == nil ||
+		tool.Annotations.ReadOnlyHint != expected.ReadOnlyHint ||
 		tool.Annotations.DestructiveHint == nil ||
-		*tool.Annotations.DestructiveHint != (operation.Effect == OperationEffectWrite) ||
-		!tool.Annotations.IdempotentHint {
+		*tool.Annotations.DestructiveHint != *expected.DestructiveHint ||
+		tool.Annotations.IdempotentHint != expected.IdempotentHint {
 		return ToolDefinition{}, fmt.Errorf(
 			"agent: MCP tool %q annotations differ from host policy", tool.Name,
 		)

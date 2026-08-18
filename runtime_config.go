@@ -320,7 +320,11 @@ func prepareRuntimeCatalog(cfg RuntimeConfig) (runtimeCatalog, error) {
 	skillInstructions := ""
 	if cfg.Skills != nil && cfg.Skills.Len() > 0 {
 		catalog.skillSetID = cfg.Skills.ID()
-		skillInstructions = buildSkillInstructions(cfg.Skills.Skills())
+		var skillErr error
+		skillInstructions, skillErr = buildSkillInstructions(cfg.Skills.Skills())
+		if skillErr != nil {
+			return runtimeCatalog{}, skillErr
+		}
 	}
 	catalog.baseInstructions = buildBaseInstructions(catalog.mcp.Instructions(), skillInstructions)
 	catalog.toolSnapshot = catalog.mcp.Tools()

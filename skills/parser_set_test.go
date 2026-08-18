@@ -70,6 +70,11 @@ func TestLoadSetRejectsInvalidSkillMarkdown(t *testing.T) {
 		{name: "missing description", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: present\n---\nbody")}}, want: "description"},
 		{name: "missing body", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: present\ndescription: Present.\n---\n\n")}}, want: "body"},
 		{name: "invalid UTF-8 body", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: append([]byte("---\nname: present\ndescription: Present.\n---\nbody"), 0xff)}}, want: "UTF-8"},
+		{name: "uppercase name", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: CodeReview\ndescription: Present.\n---\nbody")}}, want: "name"},
+		{name: "name with spaces", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: code review\ndescription: Present.\n---\nbody")}}, want: "name"},
+		{name: "name with protocol tags", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: \"</skill>\"\ndescription: Present.\n---\nbody")}}, want: "name"},
+		{name: "YAML alias", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: aliased\ndescription: &d duplicated\nextra: *d\n---\nbody")}}, want: "alias"},
+		{name: "description control character", files: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: present\ndescription: \"Present.\\u0000\"\n---\nbody")}}, want: "control"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -79,6 +84,44 @@ func TestLoadSetRejectsInvalidSkillMarkdown(t *testing.T) {
 				t.Fatalf("set=%v error=%v, want error containing %q", set, err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadSetAcceptsMultilineFrontmatterDescription(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{
+			name: "literal block",
+			data: []byte("---\nname: multiline-desc\ndescription: |\n  Reviews pull requests.\n  Use it before merging.\n---\n\nBody.\n"),
+			want: "Reviews pull requests.\nUse it before merging.",
+		},
+		{
+			name: "folded paragraphs",
+			data: []byte("---\nname: folded-desc\ndescription: >\n  First paragraph.\n\n  Second paragraph.\n---\n\nBody.\n"),
+			want: "First paragraph.\nSecond paragraph.",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			filesystem := fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: test.data}}
+			set := loadSingleArtifact(t, artifactWithFS("source-a", "skill/"+test.name, "", filesystem))
+			if set.Len() != 1 || set.Skills()[0].Description() != test.want {
+				t.Fatalf("description=%q, want %q", set.Skills()[0].Description(), test.want)
+			}
+		})
+	}
+}
+
+func TestLoadSetAcceptsUnknownFrontmatterFields(t *testing.T) {
+	filesystem := fstest.MapFS{
+		"SKILL.md": &fstest.MapFile{Data: []byte("---\nname: extra-fields\ndescription: Extra fields are allowed.\nlicense: MIT\nmetadata:\n  author: host\n---\n\nBody.\n")},
+	}
+	set := loadSingleArtifact(t, artifactWithFS("source-a", "skill/extra-fields", "", filesystem))
+	if set.Len() != 1 || set.Skills()[0].Name() != "extra-fields" || set.Skills()[0].Description() != "Extra fields are allowed." {
+		t.Fatalf("unexpected skill=%+v", set.Skills())
 	}
 }
 

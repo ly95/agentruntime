@@ -24,6 +24,9 @@ func NewOperationReconciler(
 	if operations == nil || isNilDependency(executions) {
 		return nil, errors.New("agent: operation registry and execution store are required for reconciliation")
 	}
+	if err := operations.Freeze(); err != nil {
+		return nil, err
+	}
 	return &OperationReconciler{runtime: &Runtime{
 		operations:     operations,
 		executions:     executions,

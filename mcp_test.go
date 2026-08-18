@@ -143,6 +143,25 @@ func TestValidateDiscoveredToolsRejectsUnsafeAnnotationDrift(t *testing.T) {
 	}
 }
 
+func TestValidateDiscoveredToolsRejectsWriteIdempotentHint(t *testing.T) {
+	operation := operationSummary(operation("projects.update", OperationEffectWrite))
+	destructive := true
+	drifted := &mcpsdk.Tool{
+		Name:         operation.Name,
+		Description:  operationToolDescription(operation),
+		InputSchema:  append(json.RawMessage(nil), operation.InputSchema...),
+		OutputSchema: append(json.RawMessage(nil), operation.OutputSchema...),
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint: false, DestructiveHint: &destructive, IdempotentHint: true,
+		},
+	}
+	if _, err := validateDiscoveredTools(
+		[]*mcpsdk.Tool{drifted}, []OperationSummary{operation},
+	); err == nil || !strings.Contains(err.Error(), "annotations differ") {
+		t.Fatalf("validateDiscoveredTools error=%v", err)
+	}
+}
+
 func TestMCPResultEnvelopeRoundTripsExecutionErrorClassification(t *testing.T) {
 	tests := []struct {
 		name         string

@@ -172,6 +172,19 @@ func TestNewOperationReconcilerRejectsTypedNilExecutionStore(t *testing.T) {
 	}
 }
 
+func TestNewOperationReconcilerFreezesOperationRegistry(t *testing.T) {
+	operations := NewOperationRegistry()
+	if err := operations.Register(operation("apply_change", OperationEffectWrite)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOperationReconciler(operations, &recordingStore{}); err != nil {
+		t.Fatalf("NewOperationReconciler: %v", err)
+	}
+	if err := operations.Register(operation("later_read", OperationEffectRead)); err == nil || !strings.Contains(err.Error(), "frozen") {
+		t.Fatalf("Register after NewOperationReconciler error=%v, want frozen", err)
+	}
+}
+
 func TestOperationReconcilerRejectsNilReceiver(t *testing.T) {
 	var reconciler *OperationReconciler
 
