@@ -23,8 +23,11 @@ var (
 	ErrVerificationFailed         = errors.New("agent: result verification failed")
 	ErrMaxIterations              = errors.New("agent: max iterations reached")
 	ErrSessionNotFound            = errors.New("agent: session not found")
+	ErrRunNotFound                = errors.New("agent: run not found")
 	ErrSessionConflict            = errors.New("agent: session revision conflict")
 	ErrSessionBusy                = errors.New("agent: session already has an active run")
+	ErrIdentityConflict           = errors.New("agent: runtime identity conflict")
+	ErrRunStoreProtocol           = errors.New("agent: run store protocol violation")
 	ErrSessionLeaseLost           = errors.New("agent: session lease ownership lost")
 	ErrSessionStoreNeeded         = errors.New("agent: session store is required")
 	ErrSkillSetMismatch           = errors.New("agent: session SkillSet mismatch")
@@ -88,10 +91,16 @@ func errorCode(err error) string {
 		return "max_iterations"
 	case errors.Is(err, ErrSessionNotFound):
 		return "session_not_found"
+	case errors.Is(err, ErrRunNotFound):
+		return "run_not_found"
 	case errors.Is(err, ErrSessionConflict):
 		return "session_conflict"
 	case errors.Is(err, ErrSessionBusy):
 		return "session_busy"
+	case errors.Is(err, ErrIdentityConflict):
+		return "identity_conflict"
+	case errors.Is(err, ErrRunStoreProtocol):
+		return "run_store_protocol"
 	case errors.Is(err, ErrSessionLeaseLost):
 		return "session_lease_lost"
 	case errors.Is(err, ErrSessionStoreNeeded):

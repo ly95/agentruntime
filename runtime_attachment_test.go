@@ -229,6 +229,41 @@ func TestRuntimeRejectsSessionImageWithoutDurableResolutionContract(t *testing.T
 	}
 }
 
+func TestPersistedTranscriptRejectsTransientOrUnstableImageAttachments(t *testing.T) {
+	base := ModelInputAttachment{
+		Kind: ModelInputAttachmentImage, ID: "persisted-image", Filename: "image.png", MIMEType: "image/png",
+		StorageKey: "images/persisted.png", ExpiresAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*ModelInputAttachment)
+	}{
+		{name: "materialized URL", mutate: func(attachment *ModelInputAttachment) {
+			attachment.URL = "https://attacker.invalid/injected.png"
+		}},
+		{name: "current run authority", mutate: func(attachment *ModelInputAttachment) {
+			attachment.CurrentRun = true
+		}},
+		{name: "missing storage key", mutate: func(attachment *ModelInputAttachment) {
+			attachment.StorageKey = ""
+		}},
+		{name: "missing expiry", mutate: func(attachment *ModelInputAttachment) {
+			attachment.ExpiresAt = time.Time{}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attachment := base
+			test.mutate(&attachment)
+			err := validatePersistedModelInputItems([]ModelInputItem{{
+				Type: ModelInputUserMessage, Text: "history", Attachments: []ModelInputAttachment{attachment},
+			}})
+			if err == nil {
+				t.Fatal("persisted transcript accepted transient or unstable image attachment")
+			}
+		})
+	}
+}
+
 func TestRuntimeRefreshesHistoricalImageForEveryProviderCall(t *testing.T) {
 	model := &scriptedModel{responses: []*ModelResponse{
 		{ID: "resp-reasoning-only", FinishReason: "length", HadReasoning: true, Items: []ModelOutputItem{}},
@@ -279,7 +314,7 @@ func TestRuntimeTurnsUnavailableHistoricalImageIntoOrderedTombstone(t *testing.T
 	var legacyTranscript []ModelInputItem
 	if err := json.Unmarshal([]byte(`[
 		{"type":"user_message","text":"compare","attachments":[
-			{"kind":"image","id":"legacy-image","filename":"old.png","mime_type":"image/png","url":"https://expired.example.com/old.png"},
+			{"kind":"image","id":"legacy-image","filename":"old.png","mime_type":"image/png","storage_key":"images/old.png","expires_at":"2025-01-01T00:00:00Z","url":"https://expired.example.com/old.png"},
 			{"kind":"text","id":"notes","filename":"notes.txt","mime_type":"text/plain","text":"keep this"}
 		]},
 		{"type":"assistant_output","text":"seen","output_type":"message","raw":{"type":"message","text":"seen"}}
@@ -401,7 +436,9 @@ func TestRuntimeAddsTrustedHostContextToInstructionsWithoutUserImpersonation(t *
 	}
 	if len(model.requests) != 1 || !strings.Contains(model.requests[0].Instructions, "trusted_host_context") ||
 		!strings.Contains(model.requests[0].Instructions, `"status":"applied"`) ||
-		!strings.Contains(model.requests[0].Instructions, "修改方案") {
+		!strings.Contains(model.requests[0].Instructions, "trusted current state supplied by the host") ||
+		strings.Contains(model.requests[0].Instructions, "修改方案") ||
+		strings.Contains(model.requests[0].Instructions, "modification-proposal") {
 		t.Fatalf("instructions=%q", model.requests[0].Instructions)
 	}
 	if len(model.requests[0].Input) != 1 || model.requests[0].Input[0].Type != ModelInputUserMessage || model.requests[0].Input[0].Text != "继续" {

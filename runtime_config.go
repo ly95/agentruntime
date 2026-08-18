@@ -1,15 +1,19 @@
 package agentruntime
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ly95/agentruntime/skills"
 )
 
 const (
 	defaultMaxIterations          = 8
+	defaultMaxCallsPerTurn        = 32
 	defaultSessionLeaseTTL        = 30 * time.Second
 	defaultSessionLeaseRenewal    = 10 * time.Second
 	defaultDetachedCleanupTimeout = 5 * time.Second
@@ -18,8 +22,10 @@ const (
 type Input struct {
 	// RunID is an optional trusted host-assigned identifier. Durable hosts that
 	// enqueue work before execution use it to keep the HTTP, queue, store, and
-	// event identities aligned. It is intentionally excluded from JSON input so
-	// callers cannot smuggle an arbitrary run identity through an API payload.
+	// event identities aligned. Supplying it requires a RunStore, which is the
+	// durable authority that rejects reuse except for the exact waiting run being
+	// resumed. It is intentionally excluded from JSON input so callers cannot
+	// smuggle an arbitrary run identity through an API payload.
 	RunID     string `json:"-"`
 	User      string `json:"user"`
 	SessionID string `json:"session_id,omitempty"`
@@ -28,9 +34,12 @@ type Input struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// IdempotencyScope isolates stateless write keys by trusted tenant or
 	// principal. It is required for write operations without a SessionID.
-	IdempotencyScope string                 `json:"idempotency_scope,omitempty"`
+	IdempotencyScope string                 `json:"-"`
 	Attachments      []ModelInputAttachment `json:"attachments,omitempty"`
-	Metadata         map[string]any         `json:"metadata,omitempty"`
+	// Metadata is normalized into the native exact-JSON data model. Values with
+	// custom json.Marshaler or encoding.TextMarshaler behavior are rejected so
+	// hidden encoder output cannot alter approval or persistence identity.
+	Metadata map[string]any `json:"metadata,omitempty"`
 	// ImageAttachmentResolver is a trusted, Run-scoped dependency used to
 	// materialize transient URLs for historical image attachments. It is never
 	// accepted from callers or persisted with the Run input.
@@ -57,12 +66,28 @@ type RuntimeConfig struct {
 	ContextWindow   *ContextWindowConfig
 
 	MaxIterations        int
+	MaxCallsPerTurn      int
 	SessionLeaseTTL      time.Duration
 	LeaseRenewalInterval time.Duration
 	CleanupTimeout       time.Duration
 	Now                  func() time.Time
-	NewID                func() string
+	// NewID may be invoked concurrently by concurrent Run calls. Implementations
+	// must be concurrency-safe and must not rely on Runtime holding a host-facing
+	// serialization lock while the callback executes. A custom factory requires
+	// RunStore as durable uniqueness authority after in-flight claims retire.
+	NewID func() string
 }
+
+type runtimeIdentityClaim struct {
+	kind  string
+	scope *runtimeIdentityScope
+}
+
+type runtimeIdentityScope struct {
+	claims map[string]struct{}
+}
+
+type runtimeIdentityScopeContextKey struct{}
 
 type Runtime struct {
 	model            Model
@@ -80,13 +105,17 @@ type Runtime struct {
 	skillSetID       string
 	toolSnapshot     []ToolDefinition
 	toolSnapshotID   string
+	operationSetID   string
 
 	maxIterations        int
+	maxCallsPerTurn      int
 	sessionLeaseTTL      time.Duration
 	leaseRenewalInterval time.Duration
 	cleanupTimeout       time.Duration
 	now                  func() time.Time
 	newID                func() string
+	identityMu           sync.Mutex
+	assignedIdentities   map[string]runtimeIdentityClaim
 }
 
 type Result struct {
@@ -98,19 +127,25 @@ type Result struct {
 }
 
 type agentState struct {
-	sessionID           string
-	sessionReady        bool
-	lease               *leaseGuard
-	seenCallIDs         map[string]struct{}
-	operationBatchCount uint64
-	planCallID          string
-	planExecutionID     string
-	lastResponseID      string
-	createdAt           time.Time
-	instructions        string
-	transcript          []ModelInputItem
-	checkpoint          *ContextCheckpoint
-	pendingApproval     *PendingApprovalCommit
+	sessionID              string
+	sessionReady           bool
+	lease                  *leaseGuard
+	seenCallIDs            map[string]struct{}
+	seenResponseIDs        map[string]struct{}
+	seenProviderItemIDs    map[string]struct{}
+	operationBatchCount    uint64
+	planCallID             string
+	planExecutionID        string
+	lastResponseID         string
+	createdAt              time.Time
+	instructions           string
+	persistentInstructions string
+	transcript             []ModelInputItem
+	checkpoint             *ContextCheckpoint
+	pendingApproval        *PendingApprovalCommit
+	resumedApproval        *PendingApprovalCommit
+	pendingApprovalDigest  string
+	loadedOperationSetID   string
 }
 
 type modelCallError struct {
@@ -153,6 +188,7 @@ func correlateModelCallError(modelCallID string, cause error) error {
 
 type runtimeSettings struct {
 	maxIterations        int
+	maxCallsPerTurn      int
 	sessionLeaseTTL      time.Duration
 	leaseRenewalInterval time.Duration
 	cleanupTimeout       time.Duration
@@ -167,11 +203,20 @@ type runtimeCatalog struct {
 	baseInstructions string
 	skillSetID       string
 	toolSnapshot     []ToolDefinition
+	operationSetID   string
 }
 
 func validateRuntimeDependencies(cfg RuntimeConfig) error {
+	if err := validateUTF8Boundary("runtime configuration", struct {
+		MCPInstructions string
+	}{MCPInstructions: cfg.MCPInstructions}); err != nil {
+		return err
+	}
 	if isNilDependency(cfg.Model) {
 		return errors.New("agent: model is required")
+	}
+	if cfg.NewID != nil && isNilDependency(cfg.RunStore) {
+		return errors.New("agent: custom NewID requires RunStore durable identity authority")
 	}
 	optionalDependencies := []struct {
 		name  string
@@ -199,6 +244,7 @@ func validateRuntimeDependencies(cfg RuntimeConfig) error {
 func normalizeRuntimeSettings(cfg RuntimeConfig) (runtimeSettings, error) {
 	settings := runtimeSettings{
 		maxIterations:        cfg.MaxIterations,
+		maxCallsPerTurn:      cfg.MaxCallsPerTurn,
 		sessionLeaseTTL:      cfg.SessionLeaseTTL,
 		leaseRenewalInterval: cfg.LeaseRenewalInterval,
 		cleanupTimeout:       cfg.CleanupTimeout,
@@ -210,6 +256,12 @@ func normalizeRuntimeSettings(cfg RuntimeConfig) (runtimeSettings, error) {
 	}
 	if settings.maxIterations < 0 {
 		return runtimeSettings{}, errors.New("agent: max iterations must be positive")
+	}
+	if settings.maxCallsPerTurn == 0 {
+		settings.maxCallsPerTurn = defaultMaxCallsPerTurn
+	}
+	if settings.maxCallsPerTurn < 0 {
+		return runtimeSettings{}, errors.New("agent: max calls per turn must be positive")
 	}
 	if settings.now == nil {
 		settings.now = time.Now
@@ -272,6 +324,18 @@ func prepareRuntimeCatalog(cfg RuntimeConfig) (runtimeCatalog, error) {
 	}
 	catalog.baseInstructions = buildBaseInstructions(catalog.mcp.Instructions(), skillInstructions)
 	catalog.toolSnapshot = catalog.mcp.Tools()
+	catalog.operationSetID = operationSetID(operationSummaries)
+	if err := validateUTF8Boundary("runtime catalog", struct {
+		Instructions   string
+		SkillSetID     string
+		OperationSetID string
+		Tools          []ToolDefinition
+	}{
+		Instructions: catalog.baseInstructions, SkillSetID: catalog.skillSetID,
+		OperationSetID: catalog.operationSetID, Tools: catalog.toolSnapshot,
+	}); err != nil {
+		return runtimeCatalog{}, err
+	}
 	return catalog, nil
 }
 
@@ -303,13 +367,92 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		skillSetID:           catalog.skillSetID,
 		toolSnapshot:         catalog.toolSnapshot,
 		toolSnapshotID:       toolDefinitionsID(catalog.toolSnapshot),
+		operationSetID:       catalog.operationSetID,
 		maxIterations:        settings.maxIterations,
+		maxCallsPerTurn:      settings.maxCallsPerTurn,
 		sessionLeaseTTL:      settings.sessionLeaseTTL,
 		leaseRenewalInterval: settings.leaseRenewalInterval,
 		cleanupTimeout:       settings.cleanupTimeout,
 		now:                  settings.now,
 		newID:                settings.newID,
+		assignedIdentities:   make(map[string]runtimeIdentityClaim),
 	}, nil
+}
+
+// nextGeneratedID is the single trust boundary for host-provided identity
+// factories. The host callback runs without an internal state lock so it can
+// participate in host control flow without lock inversion. Claims are scoped
+// to one exported Run or reconciliation call and retired after that call ends;
+// durable stores remain authoritative for identities retained beyond the call.
+func (r *Runtime) nextGeneratedID(ctx context.Context, kind string) (string, error) {
+	if r == nil || r.newID == nil {
+		return "", fmt.Errorf("agent: generated %s has no identity factory", kind)
+	}
+	id := r.newID()
+	if err := validateRuntimeIdentity(id, "generated "+kind); err != nil {
+		return "", err
+	}
+	if err := r.claimRuntimeIdentity(ctx, id, kind); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (r *Runtime) reserveRunIdentity(ctx context.Context, id string) error {
+	if err := validateRuntimeIdentity(id, "run id"); err != nil {
+		return err
+	}
+	if r.runStore == nil {
+		return fmt.Errorf("%w: explicit run id %q requires durable RunStore authority", ErrIdentityConflict, id)
+	}
+	return r.claimRuntimeIdentity(ctx, id, "run id")
+}
+
+func validateRuntimeIdentity(id, kind string) error {
+	if !utf8.ValidString(id) {
+		return fmt.Errorf("agent: %s must be valid UTF-8", kind)
+	}
+	if err := requireCanonicalIdentity(id, kind); err != nil {
+		return fmt.Errorf("agent: invalid runtime identity: %w", err)
+	}
+	return nil
+}
+
+func (r *Runtime) beginIdentityScope(ctx context.Context) (context.Context, *runtimeIdentityScope) {
+	scope := &runtimeIdentityScope{claims: make(map[string]struct{})}
+	return context.WithValue(ctx, runtimeIdentityScopeContextKey{}, scope), scope
+}
+
+func (r *Runtime) releaseIdentityScope(scope *runtimeIdentityScope) {
+	if r == nil || scope == nil {
+		return
+	}
+	r.identityMu.Lock()
+	defer r.identityMu.Unlock()
+	for id := range scope.claims {
+		if claim, exists := r.assignedIdentities[id]; exists && claim.scope == scope {
+			delete(r.assignedIdentities, id)
+		}
+	}
+	scope.claims = nil
+}
+
+func (r *Runtime) claimRuntimeIdentity(ctx context.Context, id, kind string) error {
+	scope, ok := ctx.Value(runtimeIdentityScopeContextKey{}).(*runtimeIdentityScope)
+	if !ok || scope == nil {
+		return fmt.Errorf("agent: %s identity %q has no active runtime scope", kind, id)
+	}
+	r.identityMu.Lock()
+	defer r.identityMu.Unlock()
+	if existing, exists := r.assignedIdentities[id]; exists {
+		return fmt.Errorf("%w: %s identity %q was already assigned as %s", ErrIdentityConflict, kind, id, existing.kind)
+	}
+	if r.assignedIdentities == nil {
+		r.assignedIdentities = make(map[string]runtimeIdentityClaim)
+	}
+	r.assignedIdentities[id] = runtimeIdentityClaim{kind: kind, scope: scope}
+	scope.claims[id] = struct{}{}
+	return nil
 }
 
 func validateRuntimeOperationConfig(operations []OperationSummary, cfg RuntimeConfig) error {

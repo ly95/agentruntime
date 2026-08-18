@@ -131,8 +131,14 @@ func TestOperationIDsUseUnambiguousFieldEncoding(t *testing.T) {
 	if leftRequest == rightRequest {
 		t.Fatalf("distinct request fields produced the same ID: %s", leftRequest)
 	}
-	leftExecution := operationExecutionID("request", 0, 0, "a", json.RawMessage("b\x00c"))
-	rightExecution := operationExecutionID("request", 0, 0, "a\x00b", json.RawMessage("c"))
+	leftExecution, err := operationExecutionID("request", 0, 0, "a", "contract-a", json.RawMessage(`"b\u0000c"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightExecution, err := operationExecutionID("request", 0, 0, "a\x00b", "contract-a", json.RawMessage(`"c"`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if leftExecution == rightExecution {
 		t.Fatalf("distinct execution fields produced the same ID: %s", leftExecution)
 	}
@@ -279,6 +285,9 @@ func TestRuntimeRejectsMismatchedRunHandleBeforeCallingModel(t *testing.T) {
 	if len(model.requests) != 0 {
 		t.Fatalf("model requests=%d, want none", len(model.requests))
 	}
+	if len(store.runs) != 0 || len(store.sessions) != 0 || len(store.leases) != 0 || len(store.leaseGenerations) != 0 {
+		t.Fatalf("rejected pre-commit handle mutated store: runs=%+v sessions=%+v leases=%+v generations=%+v", store.runs, store.sessions, store.leases, store.leaseGenerations)
+	}
 }
 
 func TestRuntimeReplaysExecutedWriteForVerificationWithoutRepeatingSideEffect(t *testing.T) {
@@ -299,7 +308,12 @@ func TestRuntimeReplaysExecutedWriteForVerificationWithoutRepeatingSideEffect(t 
 		return OperationResult{Output: json.RawMessage(`{"applied":true}`), Receipt: json.RawMessage(`{"version":1}`)}, nil
 	}), ResultVerifierFunc(func(context.Context, VerificationRequest) (VerificationResult, error) {
 		verifications++
-		return VerificationResult{Confirmed: verifications > 1, Message: "not observable yet"}, nil
+		confirmed := verifications > 1
+		evidence := json.RawMessage(`{"observable":false}`)
+		if confirmed {
+			evidence = json.RawMessage(`{"observable":true}`)
+		}
+		return VerificationResult{Confirmed: confirmed, Message: "not observable yet", Evidence: evidence}, nil
 	}), nil, store)
 	input := Input{User: "apply", SessionID: "session-verification", IdempotencyKey: "pending-verification"}
 	if _, err := rt.Run(context.Background(), input); !errors.Is(err, ErrVerificationFailed) {

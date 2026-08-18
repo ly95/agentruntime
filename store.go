@@ -35,17 +35,21 @@ const (
 )
 
 type RunRecord struct {
-	ID         string
-	SessionID  string
-	SkillSetID string `json:"SkillSetID,omitempty"`
-	Status     RunStatus
-	Input      Input
-	Result     string
-	Artifacts  []ResultArtifact
-	ErrorCode  string
-	Error      string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID             string
+	SessionID      string
+	SkillSetID     string `json:"SkillSetID,omitempty"`
+	OperationSetID string `json:"OperationSetID,omitempty"`
+	// PendingApprovalDigest binds a waiting run to the exact immutable approval
+	// checkpoint atomically committed with it.
+	PendingApprovalDigest string `json:"PendingApprovalDigest,omitempty"`
+	Status                RunStatus
+	Input                 Input
+	Result                string
+	Artifacts             []ResultArtifact
+	ErrorCode             string
+	Error                 string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 type ItemRecord struct {
@@ -70,6 +74,7 @@ type ItemRecord struct {
 type SessionState struct {
 	ID             string
 	SkillSetID     string `json:"SkillSetID,omitempty"`
+	OperationSetID string `json:"OperationSetID,omitempty"`
 	Revision       uint64
 	Transcript     []ModelInputItem
 	Checkpoint     *ContextCheckpoint
@@ -81,7 +86,8 @@ type SessionState struct {
 	UpdatedAt      time.Time
 }
 
-// RunHandle proves ownership of the session lease acquired by BeginRun.
+// RunHandle proves ownership of the session lease acquired by CreateRunV3 or
+// ResumeRunV3.
 // The store, not Runtime, owns lease recovery for abandoned runs.
 type RunHandle struct {
 	RunID           string
@@ -92,16 +98,42 @@ type RunHandle struct {
 	SessionRevision uint64
 }
 
-type BeginRunRequest struct {
+type CreateRunRequest struct {
 	Run      RunRecord
 	LeaseID  string
 	LeaseTTL time.Duration
 }
 
-type BeginRunResult struct {
+type RunStart struct {
 	Handle  RunHandle
 	Session *SessionState
 }
+
+type ResumeRunRequest struct {
+	Run         RunRecord
+	LeaseID     string
+	LeaseTTL    time.Duration
+	InputDigest string
+}
+
+type ResumedRun struct {
+	RunStart
+	PendingApprovalDigest string
+	// PendingApproval is the complete immutable authority atomically associated
+	// with PendingApprovalDigest. Runtime recomputes and validates this payload
+	// while the ResumeRunV3 transaction is still abortable.
+	PendingApproval *PendingApprovalCommit
+}
+
+// AcceptRunStart is invoked by RunStore inside its transaction after it has
+// computed the exact post-commit handle/session view and before it mutates any
+// run, approval, session, lease, or identity state. A non-nil error aborts the
+// transaction without mutation. The callback must be invoked exactly once on a
+// successful CreateRunV3 or ResumeRunV3 call.
+type AcceptRunStart func(RunStart) error
+
+// AcceptResumedRun has the same pre-commit semantics for a waiting-run resume.
+type AcceptResumedRun func(ResumedRun) error
 
 type FinishRunRequest struct {
 	Handle          RunHandle
@@ -115,9 +147,14 @@ type FinishRunRequest struct {
 // pending approval and append Audit atomically with the waiting_user Run
 // transition; an error must leave none of those mutations visible.
 type PendingApprovalCommit struct {
-	Request  ApprovalRequest
-	Decision ApprovalDecision
-	Audit    ItemRecord
+	// AuthorityVersion identifies the complete authority schema. Version zero
+	// is the pre-versioned subset digest and is intentionally not resumable:
+	// omitted request/audit fields cannot be proven after restart.
+	AuthorityVersion uint32
+	Request          ApprovalRequest
+	Decision         ApprovalDecision
+	Audit            ItemRecord
+	Digest           string
 }
 
 type RenewRunLeaseRequest struct {
@@ -135,36 +172,78 @@ type SessionLeaseFence struct {
 }
 
 // RunStore owns the transaction boundary for a run and its session.
-// BeginRun atomically creates the running run and acquires the session lease.
-// For a new session with a non-empty Run.SkillSetID, BeginRun must also create
-// and return a binding-only SessionState at revision zero. That binding is
-// independent of transcript readiness and must survive nil-Session terminal
-// writes and abandoned-lease recovery. A new run with an empty SkillSet ID
-// preserves the legacy behavior and does not require an initial SessionState.
-// Before changing a stored session, resuming a waiting run, or fencing an
-// active run, stores must compare Run.SkillSetID with every applicable stored
-// SessionState or RunRecord binding. A mismatch returns ErrSkillSetMismatch
-// without changing run status, acquiring a lease, fencing an owner, or creating
-// a session. A legacy record with no binding has the empty SkillSet ID.
+// CreateRunV3 atomically creates a previously absent running run and acquires
+// the session lease. It rejects every existing Run.ID, including waiting runs.
+// ResumeRunV3 atomically resumes only the exact waiting Run.ID and returns
+// ErrRunNotFound without mutation when no RunRecord owns that ID. Runtime uses
+// that read-only absence result to create an explicitly host-selected ID; a
+// generated ID is sent only to CreateRunV3.
+// For a new session with a non-empty Run.SkillSetID or Run.OperationSetID,
+// CreateRunV3 must also create and return a binding-only SessionState at revision
+// zero. Those bindings are independent of transcript readiness and must survive
+// nil-Session terminal writes and abandoned-lease recovery. Before changing a
+// stored session, resuming a waiting run, or fencing an active run, stores must
+// compare both immutable bindings with every applicable SessionState and
+// RunRecord. A SkillSet mismatch returns ErrSkillSetMismatch; an operation-set
+// mismatch returns ErrOperationPlanChanged. When resuming a waiting approval,
+// ResumeRunV3 must also compare InputDigest with the atomically stored approval
+// checkpoint before changing the run or acquiring a lease. A waiting run with
+// no non-empty PendingApprovalDigest or no exactly matching durable approval is
+// invalid and must be rejected before any mutation. Neither mismatch may mutate
+// state or acquire or fence a lease. A legacy record can have an empty
+// binding; Runtime upgrades it only on a successful write-free completion,
+// never while polling, pausing for approval, or rolling back a failure.
 // Stores must permit a new run to fence an expired lease, assign a monotonically
 // increasing lease generation, and return the store-owned deadline in the handle.
 // RenewRunLease extends only a live matching generation. ValidateRunLease lets
-// Runtime reject a stale owner immediately before a write side effect.
+// Runtime reject a stale owner immediately after run-start return and before a
+// write side effect.
 // FinishRun atomically terminalizes or pauses the run, commits the next session
 // snapshot when supplied, and releases the lease. Lease renewal remains active
 // while FinishRun executes, so stores must validate the live owner fields and
 // deadline; the request handle's observed LeaseDeadline may lag a renewal.
 // When PendingApproval is supplied, FinishRun must also atomically persist that
-// approval and its audit item. When immutable runtime configuration is mounted,
-// Runtime also supplies the last stable Session snapshot so that configuration
-// remains bound across pause and resume. With no such binding, Runtime preserves
-// the legacy nil-Session pause request. A failed run whose session could not be
-// validated may also pass a nil Session; the store must then leave any existing
-// snapshot, including a binding-only revision-zero state, unchanged. A non-nil
-// Session must retain the binding established by BeginRun.
-// An error from either method must leave no mutation.
+// complete approval record, its Digest, and its audit item. The approval
+// checkpoint's ExpectedSessionRevision must equal the session revision committed
+// by that same transaction, or the unchanged current revision when Session is
+// nil. Before mutating a waiting run, acquiring its lease, or fencing another
+// owner, a later ResumeRunV3 must compare the current session revision with that
+// expected revision and fail on mismatch. It then returns the approval digest
+// and a complete cloned PendingApprovalCommit before Runtime accepts
+// ApprovalResumer output. AuthorityVersion 1 hashes the complete persistent
+// request, decision, audit, normalized arguments, operation summary, input
+// identity, checkpoint, and replay. Version zero and other pre-versioned subset
+// digests are not resumable because their omitted fields cannot be proved.
+// Runtime recomputes the complete authority and binds it to the proposed session
+// inside the abortable callback; a digest-only acknowledgement is invalid. Pure pending polls retain the
+// same authority and must not write a new Session snapshot or advance its
+// revision. When immutable runtime configuration is already bound, Runtime
+// supplies the last stable Session snapshot for the initial pause so that the
+// binding survives resume. For a legacy empty operation-set binding, Runtime
+// passes a nil Session while polling or pausing for approval; the store must
+// preserve the exact existing snapshot. A failed run whose session could not be
+// validated may do the same. A non-nil Session must retain the binding
+// established by CreateRunV3 or ResumeRunV3.
+// Run.ID and every ItemRecord.ID share one durable identity namespace. CreateRunV3,
+// AppendItem, and a FinishRun carrying PendingApproval must atomically reject an
+// identity already assigned to another run or item with ErrIdentityConflict and
+// leave no mutation visible. CreateRunV3 and ResumeRunV3 are distinct so an
+// adapter cannot lose create-versus-resume intent by rewriting a request bit.
+// Both methods must invoke their acceptance callback with the exact proposed
+// result while the transaction is still abortable; callback rejection leaves
+// the prior run, approval, session, lease, and identity state unchanged. The
+// callback is invoked exactly once, synchronously, and its first result is
+// final; stores must not retry it or invoke it concurrently. Stores must also
+// check ctx and lease expiry again after callback acceptance and immediately
+// before commit. The proposed state contains the exact requested LeaseID, a
+// store-owned deadline live at callback completion, no session/lease authority
+// for stateless runs, and complete approval authority for resume. The V3 method names
+// intentionally fence older implementations until they adopt both split
+// authority paths and the pre-commit acceptance protocol. An error from either
+// method must leave no mutation.
 type RunStore interface {
-	BeginRun(ctx context.Context, request BeginRunRequest) (BeginRunResult, error)
+	CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error
+	ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error
 	RenewRunLease(ctx context.Context, request RenewRunLeaseRequest) (RunHandle, error)
 	ValidateRunLease(ctx context.Context, handle RunHandle) (RunHandle, error)
 	AppendItem(ctx context.Context, item ItemRecord) error
@@ -174,6 +253,7 @@ type RunStore interface {
 type OperationPlanStep struct {
 	ExecutionID string
 	Name        string
+	ContractID  string
 	Arguments   json.RawMessage
 }
 
@@ -218,21 +298,23 @@ const (
 )
 
 type OperationExecutionRecord struct {
-	ID               string
-	IdempotencyKey   string
-	IdempotencyScope string
-	RunID            string
-	SessionID        string
-	CallID           string
-	AttemptID        string
-	Name             string
-	Arguments        json.RawMessage
-	Status           OperationExecutionStatus
-	Result           OperationResult
-	Verification     *VerificationResult
-	Error            string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	ID                   string
+	IdempotencyKey       string
+	IdempotencyScope     string
+	RunID                string
+	SessionID            string
+	CallID               string
+	AttemptID            string
+	Name                 string
+	ContractID           string
+	VerificationRequired bool
+	Arguments            json.RawMessage
+	Status               OperationExecutionStatus
+	Result               OperationResult
+	Verification         *VerificationResult
+	Error                string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type ExecutionAcquireDisposition string
@@ -244,19 +326,20 @@ const (
 )
 
 type OperationExecutionTransition struct {
-	ID           string
-	ExecutionID  string
-	AttemptID    string
-	RunID        string
-	CallID       string
-	Actor        string
-	Message      string
-	From         OperationExecutionStatus
-	To           OperationExecutionStatus
-	Result       OperationResult
-	Verification *VerificationResult
-	Evidence     json.RawMessage
-	CreatedAt    time.Time
+	ID                   string
+	ExecutionID          string
+	AttemptID            string
+	RunID                string
+	CallID               string
+	Actor                string
+	Message              string
+	VerificationRequired bool
+	From                 OperationExecutionStatus
+	To                   OperationExecutionStatus
+	Result               OperationResult
+	Verification         *VerificationResult
+	Evidence             json.RawMessage
+	CreatedAt            time.Time
 }
 
 type AcquireExecutionRequest struct {
@@ -270,12 +353,18 @@ type AcquireExecutionResult struct {
 }
 
 func (request AcquireExecutionRequest) Validate() error {
+	if err := validateUTF8Boundary("execution acquisition request", request); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidExecutionTransition, err)
+	}
 	execution := request.Execution
 	transition := request.Transition
 	if strings.TrimSpace(execution.ID) == "" || strings.TrimSpace(execution.RunID) == "" ||
 		strings.TrimSpace(execution.CallID) == "" || strings.TrimSpace(execution.AttemptID) == "" ||
 		strings.TrimSpace(execution.Name) == "" {
 		return fmt.Errorf("%w: execution id, run id, call id, attempt id, and name are required", ErrInvalidExecutionTransition)
+	}
+	if strings.TrimSpace(execution.ContractID) == "" {
+		return fmt.Errorf("%w: execution contract id is required", ErrInvalidExecutionTransition)
 	}
 	if strings.TrimSpace(execution.IdempotencyKey) == "" {
 		return fmt.Errorf("%w: execution idempotency key is required", ErrInvalidExecutionTransition)
@@ -289,14 +378,23 @@ func (request AcquireExecutionRequest) Validate() error {
 	if execution.CreatedAt.IsZero() || execution.UpdatedAt.IsZero() || execution.UpdatedAt.Before(execution.CreatedAt) {
 		return fmt.Errorf("%w: execution timestamps are invalid", ErrInvalidExecutionTransition)
 	}
-	if len(execution.Arguments) == 0 || !json.Valid(execution.Arguments) {
+	if execution.CreatedAt.After(transition.CreatedAt) || !execution.UpdatedAt.Equal(transition.CreatedAt) {
+		return fmt.Errorf("%w: acquisition update timestamp must equal the transition timestamp and creation cannot follow it", ErrInvalidExecutionTransition)
+	}
+	if len(execution.Arguments) == 0 {
 		return fmt.Errorf("%w: execution arguments must be valid JSON", ErrInvalidExecutionTransition)
+	}
+	if _, err := decodeExactJSON(execution.Arguments); err != nil {
+		return fmt.Errorf("%w: execution arguments must be unambiguous valid JSON: %v", ErrInvalidExecutionTransition, err)
 	}
 	if hasOperationResult(execution.Result) || execution.Verification != nil || strings.TrimSpace(execution.Error) != "" {
 		return fmt.Errorf("%w: started execution cannot contain a result, verification, or error", ErrInvalidExecutionTransition)
 	}
 	if transition.ExecutionID != execution.ID || transition.AttemptID != execution.AttemptID || transition.RunID != execution.RunID || transition.CallID != execution.CallID {
 		return fmt.Errorf("%w: acquisition transition does not match execution", ErrInvalidExecutionTransition)
+	}
+	if transition.VerificationRequired != execution.VerificationRequired {
+		return fmt.Errorf("%w: acquisition verification requirement does not match execution", ErrInvalidExecutionTransition)
 	}
 	if transition.From != "" || transition.To != OperationExecutionStarted {
 		return fmt.Errorf("%w: acquisition transition must target started", ErrInvalidExecutionTransition)
@@ -315,7 +413,7 @@ func (transition OperationExecutionTransition) Validate() error {
 	switch transition.From {
 	case OperationExecutionStarted:
 		valid = transition.To == OperationExecutionExecuted || transition.To == OperationExecutionUnknown ||
-			transition.To == OperationExecutionRetryable
+			transition.To == OperationExecutionRetryable || transition.To == OperationExecutionCompleted
 	case OperationExecutionExecuted:
 		valid = transition.To == OperationExecutionCompleted || transition.To == OperationExecutionRecoveryFailed
 	case OperationExecutionUnknown:
@@ -327,13 +425,21 @@ func (transition OperationExecutionTransition) Validate() error {
 	if !valid {
 		return fmt.Errorf("%w: unsupported status change %q -> %q", ErrInvalidExecutionTransition, transition.From, transition.To)
 	}
+	if transition.From == OperationExecutionStarted && transition.To == OperationExecutionCompleted && len(transition.Evidence) == 0 {
+		return fmt.Errorf("%w: started completion requires durable reconciliation evidence", ErrInvalidExecutionTransition)
+	}
 	switch transition.To {
 	case OperationExecutionExecuted, OperationExecutionCompleted:
-		if len(transition.Result.Output) == 0 || !json.Valid(transition.Result.Output) {
+		if len(transition.Result.Output) == 0 {
 			return fmt.Errorf("%w: transition result output must be valid JSON", ErrInvalidExecutionTransition)
 		}
-		if len(transition.Result.Receipt) > 0 && !json.Valid(transition.Result.Receipt) {
-			return fmt.Errorf("%w: completed receipt must be valid JSON", ErrInvalidExecutionTransition)
+		if _, err := decodeExactJSON(transition.Result.Output); err != nil {
+			return fmt.Errorf("%w: transition result output must be valid JSON and unambiguous: %v", ErrInvalidExecutionTransition, err)
+		}
+		if len(transition.Result.Receipt) > 0 {
+			if _, err := decodeExactJSON(transition.Result.Receipt); err != nil {
+				return fmt.Errorf("%w: completed receipt must be valid JSON and unambiguous: %v", ErrInvalidExecutionTransition, err)
+			}
 		}
 		if err := validateResultArtifacts(transition.Result.Artifacts); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidExecutionTransition, err)
@@ -346,29 +452,37 @@ func (transition OperationExecutionTransition) Validate() error {
 	if transition.To != OperationExecutionCompleted && transition.Verification != nil {
 		return fmt.Errorf("%w: only completed state can contain verification", ErrInvalidExecutionTransition)
 	}
+	if transition.To == OperationExecutionCompleted && transition.VerificationRequired && transition.Verification == nil {
+		return fmt.Errorf("%w: confirmation-required completion must contain verification", ErrInvalidExecutionTransition)
+	}
+	if transition.To == OperationExecutionCompleted && !transition.VerificationRequired && transition.Verification != nil {
+		return fmt.Errorf("%w: direct completion cannot contain verification", ErrInvalidExecutionTransition)
+	}
 	if transition.Verification != nil {
-		if !transition.Verification.Confirmed {
-			return fmt.Errorf("%w: completed verification must be confirmed", ErrInvalidExecutionTransition)
-		}
-		if len(transition.Verification.Evidence) > 0 && !json.Valid(transition.Verification.Evidence) {
-			return fmt.Errorf("%w: verification evidence must be valid JSON", ErrInvalidExecutionTransition)
+		if _, err := normalizePositiveVerificationResult(*transition.Verification); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidExecutionTransition, err)
 		}
 	}
 	return nil
 }
 
 func hasOperationResult(result OperationResult) bool {
-	return len(result.Output) > 0 || len(result.Receipt) > 0 || strings.TrimSpace(result.FinalResponse) != "" || len(result.Artifacts) > 0
+	return len(result.Output) > 0 || len(result.Receipt) > 0 || strings.TrimSpace(result.FinalResponse) != "" || len(result.Artifacts) > 0 || result.Continue
 }
 
 func (transition OperationExecutionTransition) validateFields() error {
+	if err := validateUTF8Boundary("execution transition", transition); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidExecutionTransition, err)
+	}
 	if strings.TrimSpace(transition.ID) == "" || strings.TrimSpace(transition.ExecutionID) == "" || strings.TrimSpace(transition.AttemptID) == "" ||
 		strings.TrimSpace(transition.RunID) == "" || strings.TrimSpace(transition.CallID) == "" ||
 		strings.TrimSpace(transition.Actor) == "" || strings.TrimSpace(transition.Message) == "" {
 		return fmt.Errorf("%w: transition id, execution id, attempt id, run id, call id, actor, and message are required", ErrInvalidExecutionTransition)
 	}
-	if len(transition.Evidence) > 0 && !json.Valid(transition.Evidence) {
-		return fmt.Errorf("%w: transition evidence must be valid JSON", ErrInvalidExecutionTransition)
+	if len(transition.Evidence) > 0 {
+		if err := validateNonNullExactJSON(transition.Evidence); err != nil {
+			return fmt.Errorf("%w: transition evidence must be non-null unambiguous valid JSON: %v", ErrInvalidExecutionTransition, err)
+		}
 	}
 	if transition.CreatedAt.IsZero() {
 		return fmt.Errorf("%w: transition timestamp is required", ErrInvalidExecutionTransition)
@@ -376,10 +490,28 @@ func (transition OperationExecutionTransition) validateFields() error {
 	return nil
 }
 
-// ExecutionStore owns durable write plans and write-operation state.
+// ExecutionStore owns durable write plans and write-operation state. Stores
+// must compare each plan step and execution ContractID and the execution's
+// VerificationRequired bit on every reservation, acquisition, and transition.
 // ReservePlanBatch preserves the first batch at each index and rejects new
 // batches after SealPlan. AcquireExecution and TransitionExecution atomically
-// update the current record and append an immutable transition.
+// update the current record and append an immutable transition. Every persisted
+// OperationExecutionTransition.ID is unique across all execution histories;
+// every acquired AttemptID is unique within its execution history so an old
+// owner token cannot become current again. Reuse must return ErrIdentityConflict
+// without mutation. Every returned execution record must preserve its immutable
+// identity and satisfy the status payload contract: started has no
+// result/error/verification; executed has a
+// result only; completed has a result and exactly the verification required by
+// its contract; unknown and retryable have only the transition error; and
+// recovery_failed preserves any prior executed result, has the transition
+// error, and has no verification. A newly acquired record must return UpdatedAt
+// exactly equal to the acquisition event time (with CreatedAt no later than that
+// event so retries can preserve the original creation time), and every
+// TransitionExecution acknowledgement must return UpdatedAt exactly equal to
+// the requested transition time. Started may transition directly to completed
+// only for an evidence-bearing reconciliation of the exact fenced attempt after
+// the executor may have committed but post-effect journaling could not be proved.
 // ValidateExecutionAttempt rejects owners fenced by reconciliation or retry;
 // write executors must still perform the same check atomically with their
 // external side effect.
@@ -399,6 +531,9 @@ const (
 	OperationReconciliationRetry    OperationReconciliationAction = "retry"
 	OperationReconciliationComplete OperationReconciliationAction = "complete"
 	OperationReconciliationFail     OperationReconciliationAction = "fail"
+	// OperationReconciliationAbandon releases a started attempt only after a
+	// trusted reconciler proves from supplied evidence that its executor never began.
+	OperationReconciliationAbandon OperationReconciliationAction = "abandon"
 )
 
 type ReconcileOperationRequest struct {
@@ -406,6 +541,7 @@ type ReconcileOperationRequest struct {
 	ExpectedAttemptID string
 	Action            OperationReconciliationAction
 	Result            OperationResult
+	Verification      *VerificationResult
 	Actor             string
 	Message           string
 	Evidence          json.RawMessage

@@ -18,12 +18,53 @@ type resumableApprover struct {
 	mutateResume func(*ApprovalResume)
 }
 
+// persistedApprovalResumer simulates a fresh process: it reconstructs resume
+// state exclusively from the approval atomically committed by recordingStore.
+type persistedApprovalResumer struct {
+	store        *recordingStore
+	approved     *bool
+	reason       string
+	mutateResume func(*ApprovalResume)
+}
+
+func (a *persistedApprovalResumer) RequestApproval(context.Context, ApprovalRequest) (ApprovalDecision, error) {
+	return ApprovalDecision{}, errors.New("persisted approval resumer cannot create a new approval")
+}
+
+func (a *persistedApprovalResumer) ResumeApproval(_ context.Context, runID string) (*ApprovalResume, error) {
+	pending, err := a.store.pendingApprovalForTest(runID)
+	if err != nil || pending == nil {
+		return nil, err
+	}
+	request := pending.Request
+	resume := &ApprovalResume{
+		ID: pending.Decision.ID, ExecutionID: request.Operation.ExecutionID,
+		Operation: request.Operation.Operation.Name, ContractID: request.Operation.Operation.ContractID,
+		Call: request.Operation.Call, ResponseID: request.ResponseID,
+		ModelOutput: cloneModelOutputItems(request.ModelOutput),
+		Preview:     append(json.RawMessage(nil), request.Preview...),
+		Checkpoint:  cloneApprovalCheckpoint(request.Checkpoint, true),
+		Reason:      a.reason,
+	}
+	if a.approved == nil {
+		resume.Pending = true
+	} else {
+		resume.Approved = *a.approved
+	}
+	if a.mutateResume != nil {
+		a.mutateResume(resume)
+	}
+	return resume, nil
+}
+
 func (a *resumableApprover) RequestApproval(_ context.Context, request ApprovalRequest) (ApprovalDecision, error) {
 	a.calls++
 	if a.request == nil {
 		cloned := request
 		cloned.ModelOutput = cloneModelOutputItems(request.ModelOutput)
 		cloned.Operation.Call.Input = append(json.RawMessage(nil), request.Operation.Call.Input...)
+		cloned.Preview = append(json.RawMessage(nil), request.Preview...)
+		cloned.Checkpoint = cloneApprovalCheckpoint(request.Checkpoint, true)
 		a.request = &cloned
 	}
 	if a.approved == nil {
@@ -38,8 +79,9 @@ func (a *resumableApprover) ResumeApproval(_ context.Context, runID string) (*Ap
 	}
 	resume := &ApprovalResume{
 		ID: "approval-1", ExecutionID: a.request.Operation.ExecutionID,
-		Operation: a.request.Operation.Operation.Name, Call: a.request.Operation.Call,
+		Operation: a.request.Operation.Operation.Name, ContractID: a.request.Operation.Operation.ContractID, Call: a.request.Operation.Call,
 		ResponseID: a.request.ResponseID, ModelOutput: cloneModelOutputItems(a.request.ModelOutput), Reason: a.reason,
+		Preview: append(json.RawMessage(nil), a.request.Preview...), Checkpoint: cloneApprovalCheckpoint(a.request.Checkpoint, true),
 	}
 	if a.approved == nil {
 		resume.Pending = true
@@ -144,7 +186,7 @@ func TestRuntimeDoesNotRetryReasoningOnlyResponseMoreThanOnce(t *testing.T) {
 
 func TestRuntimeUsesHostAssignedRunID(t *testing.T) {
 	model := &scriptedModel{responses: []*ModelResponse{messageResponse("resp-host-run", "done")}}
-	rt := newTestRuntime(t, model, nil, nil, nil, nil, nil, nil)
+	rt := newTestRuntime(t, model, nil, nil, nil, nil, nil, &recordingStore{})
 
 	result, err := rt.Run(context.Background(), Input{RunID: "durable-run-42", User: "request"})
 	if err != nil {
@@ -355,7 +397,7 @@ func TestRuntimeClosesModelLifecycleWhenResponseMarshalFails(t *testing.T) {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	_, err = rt.Run(context.Background(), Input{User: "hello"})
-	if err == nil || !strings.Contains(err.Error(), "marshal model response") {
+	if err == nil || !strings.Contains(err.Error(), "cannot be replayed") {
 		t.Fatalf("Run error=%v", err)
 	}
 
@@ -384,7 +426,7 @@ func TestRuntimeCorrelatesInvalidModelOutput(t *testing.T) {
 	}
 
 	started, completed, failed, runFailed, terminalCount := modelLifecycleEvents(events)
-	if terminalCount != 1 || started.ModelCallID == "" || completed.ModelCallID != started.ModelCallID || failed.ModelCallID != "" || runFailed.ModelCallID != started.ModelCallID {
+	if terminalCount != 1 || started.ModelCallID == "" || completed.ModelCallID != "" || failed.ModelCallID != started.ModelCallID || runFailed.ModelCallID != started.ModelCallID {
 		t.Fatalf("lifecycle events: started=%+v completed=%+v failed=%+v run_failed=%+v", started, completed, failed, runFailed)
 	}
 	assertStoredErrorModelCallID(t, store.items, started.ModelCallID)

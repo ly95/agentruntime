@@ -18,7 +18,7 @@ func TestRuntimeResumesApprovalWithCanonicalizedDefaultInput(t *testing.T) {
 	}}
 	ops := NewOperationRegistry()
 	if err := ops.Register(Operation{
-		Name: "power_on", Description: "power on", Effect: OperationEffectWrite,
+		Name: "power_on", ContractVersion: "test-v1", Description: "power on", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{
             "type":"object",
             "properties":{"model_key":{"type":["string","null"]}},
@@ -219,6 +219,17 @@ func TestRuntimeBatchesHomogeneousTerminalWriteOperations(t *testing.T) {
 	terminal := operation("save_proposal", OperationEffectWrite)
 	terminal.Terminal = true
 	terminal.TerminalBatchLimit = 4
+	terminal.ProjectTerminalSession = func(arguments any) ([]TerminalSessionProjection, error) {
+		values, ok := arguments.(map[string]any)
+		if !ok {
+			return nil, errors.New("arguments are not an object")
+		}
+		summary, err := json.Marshal(map[string]any{"target": values["target"]})
+		if err != nil {
+			return nil, err
+		}
+		return []TerminalSessionProjection{{Type: "proposal", SessionSummary: summary}}, nil
+	}
 	if err := ops.Register(terminal); err != nil {
 		t.Fatal(err)
 	}
@@ -230,11 +241,15 @@ func TestRuntimeBatchesHomogeneousTerminalWriteOperations(t *testing.T) {
 		if err != nil {
 			return OperationResult{}, err
 		}
+		summary, err := json.Marshal(map[string]any{"target": request.Arguments.(map[string]any)["target"]})
+		if err != nil {
+			return OperationResult{}, err
+		}
 		return OperationResult{
 			Output: json.RawMessage(`{"saved":true}`), Receipt: json.RawMessage(`{"persisted":true}`),
 			FinalResponse: "视频生成方案已保存。",
 			Artifacts: []ResultArtifact{{
-				Type: "proposal", Data: artifact, SessionSummary: artifact,
+				Type: "proposal", Data: artifact, SessionSummary: summary,
 			}},
 		}, nil
 	})
@@ -272,8 +287,8 @@ func TestRuntimeBatchesHomogeneousTerminalWriteOperations(t *testing.T) {
 			t.Fatalf("terminal batch function-call pair survived projection: %+v", session.Transcript)
 		}
 	}
-	if !bytes.Contains(session.Transcript[1].Raw, []byte(`\"call_id\":\"call-1\"`)) ||
-		!bytes.Contains(session.Transcript[1].Raw, []byte(`\"call_id\":\"call-2\"`)) {
+	if !bytes.Contains(session.Transcript[1].Raw, []byte(`\"target\":\"frame-1\"`)) ||
+		!bytes.Contains(session.Transcript[1].Raw, []byte(`\"target\":\"frame-4\"`)) {
 		t.Fatalf("projected batch history=%s", session.Transcript[1].Raw)
 	}
 }

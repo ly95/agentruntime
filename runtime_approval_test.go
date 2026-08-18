@@ -143,7 +143,7 @@ func TestRuntimeWaitsForApprovalAndResumesSameRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Status != RunStatusCompleted || second.Output != "applied" || executions != 1 || approver.calls != 2 || len(model.requests) != 2 {
+	if second.Status != RunStatusCompleted || second.Output != "applied" || executions != 1 || approver.calls != 1 || len(model.requests) != 2 {
 		t.Fatalf("second=%+v executions=%d approvals=%d model_calls=%d", second, executions, approver.calls, len(model.requests))
 	}
 	if second.LastResponseID != "resp-2" || approver.request == nil || approver.request.ResponseID != "resp-1" {

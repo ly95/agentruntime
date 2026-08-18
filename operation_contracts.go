@@ -3,11 +3,14 @@ package agentruntime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -29,13 +32,17 @@ func (r *OperationRegistry) BuildApprovalPreview(name string, arguments any) (js
 	}
 	preview, err := op.ApprovalPreview(arguments)
 	if err != nil {
-		return nil, fmt.Errorf("agent: build approval preview for %q: %w", name, err)
+		return nil, fmt.Errorf("agent: build approval preview for %q: %w", name, validateUTF8Error("approval preview", err))
 	}
-	if len(preview) == 0 || !json.Valid(preview) {
+	if len(preview) == 0 {
 		return nil, fmt.Errorf("agent: approval preview for %q must be valid JSON", name)
 	}
-	var object map[string]any
-	if err := json.Unmarshal(preview, &object); err != nil || object == nil {
+	value, err := decodeExactJSON(preview)
+	if err != nil {
+		return nil, fmt.Errorf("agent: approval preview for %q must be unambiguous valid JSON: %w", name, err)
+	}
+	object, ok := value.(map[string]any)
+	if !ok || object == nil {
 		return nil, fmt.Errorf("agent: approval preview for %q must be a JSON object", name)
 	}
 	if len(object) == 0 {
@@ -45,10 +52,8 @@ func (r *OperationRegistry) BuildApprovalPreview(name string, arguments any) (js
 }
 
 func compileOperationSchema(name string, raw json.RawMessage) (*jsonschema.Schema, error) {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var document any
-	if err := decoder.Decode(&document); err != nil {
+	document, err := decodeExactJSON(raw)
+	if err != nil {
 		return nil, err
 	}
 	location := "urn:agent:operation:" + name
@@ -72,11 +77,12 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func validateOperationInputSchema(raw json.RawMessage) error {
-	var document map[string]any
-	if err := json.Unmarshal(raw, &document); err != nil {
+	value, err := decodeExactJSON(raw)
+	if err != nil {
 		return err
 	}
-	if document == nil {
+	document, ok := value.(map[string]any)
+	if !ok || document == nil {
 		return errors.New("must be a JSON object schema")
 	}
 	typeName, _ := document["type"].(string)
@@ -87,23 +93,78 @@ func validateOperationInputSchema(raw json.RawMessage) error {
 }
 
 func operationSummary(op Operation) OperationSummary {
-	return OperationSummary{
-		Name:               op.Name,
-		PreviousNames:      append([]string(nil), op.PreviousNames...),
-		Description:        op.Description,
+	confirmation := op.Confirmation
+	confirmation.Description = strings.TrimSpace(confirmation.Description)
+	summary := OperationSummary{
+		Name:               strings.TrimSpace(op.Name),
+		PreviousNames:      normalizeNames(op.PreviousNames),
+		Description:        strings.TrimSpace(op.Description),
 		InputSchema:        append(json.RawMessage(nil), op.InputSchema...),
 		OutputSchema:       append(json.RawMessage(nil), op.OutputSchema...),
 		Effect:             op.Effect,
-		Capabilities:       append([]string(nil), op.Capabilities...),
-		Confirmation:       op.Confirmation,
+		Capabilities:       normalizeNames(op.Capabilities),
+		Confirmation:       confirmation,
 		Terminal:           op.Terminal,
 		TerminalBatchLimit: op.TerminalBatchLimit,
 	}
+	summary.ContractID = operationContractID(summary, op)
+	return summary
+}
+
+func operationContractID(summary OperationSummary, op Operation) string {
+	digest := sha256.New()
+	writeHashField(digest, []byte(summary.Name))
+	writeHashField(digest, []byte(strings.TrimSpace(op.ContractVersion)))
+	for _, previousName := range summary.PreviousNames {
+		writeHashField(digest, []byte(previousName))
+	}
+	writeHashField(digest, []byte(summary.Description))
+	writeHashField(digest, operationSchemaIdentity(op.InputSchema, op.inputSchemaIdentity))
+	writeHashField(digest, operationSchemaIdentity(op.OutputSchema, op.outputSchemaIdentity))
+	writeHashField(digest, []byte(summary.Effect))
+	for _, capability := range summary.Capabilities {
+		writeHashField(digest, []byte(capability))
+	}
+	writeHashField(digest, []byte(summary.Confirmation.Mode))
+	writeHashField(digest, []byte(summary.Confirmation.Description))
+	writeHashField(digest, []byte(strconv.FormatBool(op.NormalizeInput != nil)))
+	writeHashField(digest, []byte(strconv.FormatBool(op.ApprovalPreview != nil)))
+	writeHashField(digest, []byte(strconv.FormatBool(op.ProjectTerminalSession != nil)))
+	writeHashField(digest, []byte(strconv.FormatBool(summary.Terminal)))
+	writeHashField(digest, []byte(strconv.Itoa(summary.TerminalBatchLimit)))
+	return "contract_" + hex.EncodeToString(digest.Sum(nil))
+}
+
+func operationSchemaIdentity(raw, registeredIdentity json.RawMessage) []byte {
+	if len(registeredIdentity) != 0 {
+		return registeredIdentity
+	}
+	canonical, err := canonicalJSONIdentity(raw)
+	if err != nil {
+		// Unregistered Operations can be summarized by package-internal callers,
+		// but Register rejects this invalid schema before it can enter Runtime.
+		return append([]byte(nil), raw...)
+	}
+	return canonical
+}
+
+func operationSetID(summaries []OperationSummary) string {
+	if len(summaries) == 0 {
+		return ""
+	}
+	digest := sha256.New()
+	for _, summary := range summaries {
+		writeHashField(digest, []byte(summary.Name))
+		writeHashField(digest, []byte(summary.ContractID))
+	}
+	return "operation_set_" + hex.EncodeToString(digest.Sum(nil))
 }
 
 func cloneOperation(op Operation) Operation {
 	op.InputSchema = append(json.RawMessage(nil), op.InputSchema...)
 	op.OutputSchema = append(json.RawMessage(nil), op.OutputSchema...)
+	op.inputSchemaIdentity = append(json.RawMessage(nil), op.inputSchemaIdentity...)
+	op.outputSchemaIdentity = append(json.RawMessage(nil), op.outputSchemaIdentity...)
 	op.Capabilities = append([]string(nil), op.Capabilities...)
 	op.PreviousNames = append([]string(nil), op.PreviousNames...)
 	return op
@@ -177,32 +238,132 @@ type ResultArtifact struct {
 	SessionSummary json.RawMessage `json:"session_summary,omitempty"`
 }
 
+// TerminalSessionProjection is the bounded, public portion of a terminal
+// artifact that Runtime may retain as future model context. Terminal writes
+// declare these projections before execution through ProjectTerminalSession.
+type TerminalSessionProjection struct {
+	Type           string          `json:"artifact_type"`
+	SessionSummary json.RawMessage `json:"session_summary"`
+}
+
+func (r *OperationRegistry) BuildTerminalSessionProjection(name string, arguments any) ([]TerminalSessionProjection, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: %s", ErrOperationNotFound, name)
+	}
+	r.mu.RLock()
+	op, ok := r.ops[strings.TrimSpace(name)]
+	r.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrOperationNotFound, name)
+	}
+	if !op.Terminal || op.Effect != OperationEffectWrite || op.ProjectTerminalSession == nil {
+		return nil, fmt.Errorf("agent: operation %q has no terminal write session projection", name)
+	}
+	projections, err := op.ProjectTerminalSession(arguments)
+	if err != nil {
+		return nil, fmt.Errorf("agent: project terminal session for %q: %w", name, validateUTF8Error("terminal session projector", err))
+	}
+	projections = cloneTerminalSessionProjections(projections)
+	if err := validateTerminalSessionProjections(projections); err != nil {
+		return nil, fmt.Errorf("agent: terminal session projection for %q: %w", name, err)
+	}
+	return projections, nil
+}
+
+func cloneTerminalSessionProjections(projections []TerminalSessionProjection) []TerminalSessionProjection {
+	out := make([]TerminalSessionProjection, len(projections))
+	for index := range projections {
+		out[index] = TerminalSessionProjection{
+			Type:           strings.TrimSpace(projections[index].Type),
+			SessionSummary: append(json.RawMessage(nil), projections[index].SessionSummary...),
+		}
+	}
+	return out
+}
+
+func validateTerminalSessionProjections(projections []TerminalSessionProjection) error {
+	for index, projection := range projections {
+		if !utf8.ValidString(projection.Type) {
+			return fmt.Errorf("projection %d type must be valid UTF-8", index)
+		}
+		if strings.TrimSpace(projection.Type) == "" {
+			return fmt.Errorf("projection %d type is required", index)
+		}
+		if len(projection.SessionSummary) == 0 || len(projection.SessionSummary) > MaxResultArtifactSessionSummaryBytes {
+			return fmt.Errorf("projection %d session summary must be between 1 and %d bytes", index, MaxResultArtifactSessionSummaryBytes)
+		}
+		if !utf8.Valid(projection.SessionSummary) {
+			return fmt.Errorf("projection %d session summary must be valid UTF-8 JSON", index)
+		}
+		trimmed := bytes.TrimSpace(projection.SessionSummary)
+		value, err := decodeExactJSON(trimmed)
+		if err != nil {
+			return fmt.Errorf("projection %d session summary must be unambiguous valid JSON: %w", index, err)
+		}
+		object, ok := value.(map[string]any)
+		if len(trimmed) == 0 || trimmed[0] != '{' || !ok || object == nil {
+			return fmt.Errorf("projection %d session summary must be a JSON object", index)
+		}
+	}
+	if _, err := terminalSessionHistoryItem("validation", projections); err != nil {
+		return err
+	}
+	return nil
+}
+
+func equalTerminalSessionProjections(left, right []TerminalSessionProjection) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if strings.TrimSpace(left[index].Type) != strings.TrimSpace(right[index].Type) ||
+			!jsonSemanticallyEqual(left[index].SessionSummary, right[index].SessionSummary) {
+			return false
+		}
+	}
+	return true
+}
+
 func validateResultArtifacts(artifacts []ResultArtifact) error {
 	for index, artifact := range artifacts {
+		if !utf8.ValidString(artifact.Type) {
+			return fmt.Errorf("result artifact %d type must be valid UTF-8", index)
+		}
 		if strings.TrimSpace(artifact.Type) == "" {
 			return fmt.Errorf("result artifact %d type is required", index)
 		}
-		if len(artifact.Data) == 0 || !json.Valid(artifact.Data) {
+		if len(artifact.Data) == 0 {
 			return fmt.Errorf("result artifact %d data must be valid JSON", index)
 		}
-		if len(artifact.InternalData) > 0 && !json.Valid(artifact.InternalData) {
-			return fmt.Errorf("result artifact %d internal data must be valid JSON", index)
+		if _, err := decodeExactJSON(artifact.Data); err != nil {
+			return fmt.Errorf("result artifact %d data must be valid JSON and unambiguous: %w", index, err)
+		}
+		if len(artifact.InternalData) > 0 {
+			if _, err := decodeExactJSON(artifact.InternalData); err != nil {
+				return fmt.Errorf("result artifact %d internal data must be valid JSON and unambiguous: %w", index, err)
+			}
 		}
 		if len(artifact.SessionSummary) > 0 {
 			if len(artifact.SessionSummary) > MaxResultArtifactSessionSummaryBytes {
 				return fmt.Errorf("result artifact %d session summary exceeds %d bytes", index, MaxResultArtifactSessionSummaryBytes)
 			}
-			if !utf8.Valid(artifact.SessionSummary) || !json.Valid(artifact.SessionSummary) {
+			if !utf8.Valid(artifact.SessionSummary) {
 				return fmt.Errorf("result artifact %d session summary must be valid UTF-8 JSON", index)
 			}
 			trimmed := bytes.TrimSpace(artifact.SessionSummary)
-			if len(trimmed) == 0 || trimmed[0] != '{' {
+			value, err := decodeExactJSON(trimmed)
+			if err != nil {
+				return fmt.Errorf("result artifact %d session summary must be unambiguous valid JSON: %w", index, err)
+			}
+			object, ok := value.(map[string]any)
+			if len(trimmed) == 0 || trimmed[0] != '{' || !ok || object == nil {
 				return fmt.Errorf("result artifact %d session summary must be a JSON object", index)
 			}
-			var object map[string]json.RawMessage
-			if err := json.Unmarshal(trimmed, &object); err != nil || object == nil {
-				return fmt.Errorf("result artifact %d session summary must be a JSON object", index)
-			}
+		}
+	}
+	if projections := terminalArtifactProjections(artifacts); len(projections) > 0 {
+		if err := validateTerminalSessionProjections(projections); err != nil {
+			return fmt.Errorf("terminal session projection: %w", err)
 		}
 	}
 	return nil
@@ -242,6 +403,21 @@ type ApprovalRequest struct {
 	ResponseID  string
 	ModelOutput []ModelOutputItem
 	Preview     json.RawMessage
+	Checkpoint  *ApprovalCheckpoint
+}
+
+// ApprovalCheckpoint is the immutable in-run state required to resume one
+// pending approval without replaying or renumbering earlier operation batches.
+type ApprovalCheckpoint struct {
+	Transcript              []ModelInputItem
+	ContextCheckpoint       *ContextCheckpoint
+	SeenCallIDs             []string
+	OperationBatchCount     uint64
+	PlanBatchIndex          uint64
+	PlanCallID              string
+	PlanExecutionID         string
+	InputDigest             string
+	ExpectedSessionRevision uint64 `json:"ExpectedSessionRevision,omitempty"`
 }
 
 type ApprovalDecision struct {
@@ -259,10 +435,12 @@ type ApprovalResume struct {
 	ID          string
 	ExecutionID string
 	Operation   string
+	ContractID  string
 	Call        ToolCall
 	ResponseID  string
 	ModelOutput []ModelOutputItem
 	Preview     json.RawMessage
+	Checkpoint  *ApprovalCheckpoint
 	Pending     bool
 	Approved    bool
 	Reason      string

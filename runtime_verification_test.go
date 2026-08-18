@@ -39,12 +39,13 @@ func TestRuntimeConfirmationNoneWriteCompletesWithoutApprovalOrVerification(t *t
 	}}
 	ops := NewOperationRegistry()
 	if err := ops.Register(Operation{
-		Name: "queue_work", Description: "queue", Effect: OperationEffectWrite,
+		Name: "queue_work", ContractVersion: "test-v1", Description: "queue", Effect: OperationEffectWrite,
 		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{
 			"type":"object","properties":{"queued":{"type":"boolean"}},"required":["queued"]
 		}`),
-		Confirmation: ConfirmationSpec{Mode: ConfirmationNone},
-		Terminal:     true,
+		Confirmation:           ConfirmationSpec{Mode: ConfirmationNone},
+		Terminal:               true,
+		ProjectTerminalSession: func(any) ([]TerminalSessionProjection, error) { return nil, nil },
 	}); err != nil {
 		t.Fatal(err)
 	}

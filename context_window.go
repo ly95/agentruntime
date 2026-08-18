@@ -107,6 +107,9 @@ func isNilDependency(value any) bool {
 }
 
 func validateContextSummary(summary ContextSummary) error {
+	if err := validateUTF8Boundary("context summary", summary); err != nil {
+		return err
+	}
 	if strings.TrimSpace(summary.Summary) == "" {
 		return errors.New("summary is required")
 	}
@@ -476,8 +479,12 @@ func (r *Runtime) commitContextCheckpoint(
 			"%w: marshal checkpoint audit: %v", ErrContextCompactionFailed, err,
 		))
 	}
+	itemID, err := r.nextGeneratedID(ctx, "context checkpoint item id")
+	if err != nil {
+		return r.failContextCompaction(run, inputTokens, prefixEnd, err)
+	}
 	if err := r.appendItem(ctx, ItemRecord{
-		ID: r.newID(), RunID: run.ID, SessionID: run.SessionID,
+		ID: itemID, RunID: run.ID, SessionID: run.SessionID,
 		Type: ItemTypeContextCheckpoint, Data: data, CreatedAt: r.now(),
 	}); err != nil {
 		return r.failContextCompaction(run, inputTokens, prefixEnd, fmt.Errorf(

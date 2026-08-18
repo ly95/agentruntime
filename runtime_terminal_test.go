@@ -31,7 +31,7 @@ func TestRuntimeTerminalWriteMissingFinalResponseStaysRecoverable(t *testing.T) 
 		}, nil
 	}), ResultVerifierFunc(func(context.Context, VerificationRequest) (VerificationResult, error) {
 		verifications++
-		return VerificationResult{Confirmed: true}, nil
+		return VerificationResult{Confirmed: true, Evidence: json.RawMessage(`{"observed":true}`)}, nil
 	}), nil, store)
 	input := Input{
 		User: "finish", IdempotencyKey: "terminal-missing-final-response", IdempotencyScope: "test",
@@ -111,7 +111,8 @@ func reconcileMissingTerminalResponse(
 	if err := runtime.ReconcileOperation(t.Context(), ReconcileOperationRequest{
 		ExecutionID: unknown.ID, ExpectedAttemptID: unknown.AttemptID,
 		Action: OperationReconciliationComplete, Result: recoveredResult,
-		Actor: "test-host", Message: "host recovered the terminal response",
+		Verification: &VerificationResult{Confirmed: true, Message: "host verified", Evidence: json.RawMessage(`{"version":1}`)},
+		Actor:        "test-host", Message: "host recovered the terminal response",
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
 	}
@@ -350,7 +351,7 @@ func assertTerminalProjectionAudit(t *testing.T, items []ItemRecord) {
 	}
 }
 
-func TestRuntimeSessionSummaryProjectionFailureRestoresStableSession(t *testing.T) {
+func TestRuntimeRejectsTerminalReadRawIdentityBeforeSideEffectsAndRestoresStableSession(t *testing.T) {
 	terminalCall := ToolCall{ID: "call-terminal", Name: "finish_change_set", Input: json.RawMessage(`{}`)}
 	model := &scriptedModel{responses: []*ModelResponse{
 		messageResponse("stable-response", "stable"),
@@ -368,7 +369,9 @@ func TestRuntimeSessionSummaryProjectionFailureRestoresStableSession(t *testing.
 	if err := ops.Register(terminal); err != nil {
 		t.Fatal(err)
 	}
+	executorCalls := 0
 	executor := OperationExecutorFunc(func(context.Context, OperationRequest) (OperationResult, error) {
+		executorCalls++
 		return OperationResult{
 			Output: json.RawMessage(`{"done":true}`), FinalResponse: "prepared",
 			Artifacts: []ResultArtifact{{
@@ -386,8 +389,11 @@ func TestRuntimeSessionSummaryProjectionFailureRestoresStableSession(t *testing.
 	}
 	stable := cloneModelInputItems(store.sessions["stable-session"].Transcript)
 	if _, err := rt.Run(context.Background(), Input{User: "prepare", SessionID: "stable-session"}); err == nil ||
-		!strings.Contains(err.Error(), "raw payload does not identify the paired call") {
-		t.Fatalf("Run error=%v, want safe projection failure", err)
+		!strings.Contains(err.Error(), "cannot be projected before execution") {
+		t.Fatalf("Run error=%v, want pre-effect Raw identity rejection", err)
+	}
+	if executorCalls != 0 {
+		t.Fatalf("executor calls=%d, want zero", executorCalls)
 	}
 	after := store.sessions["stable-session"]
 	if len(after.Transcript) != len(stable) || after.LastResponseID != "stable-response" || after.LastError == "" {
@@ -411,7 +417,7 @@ func TestRuntimeSessionSummaryProjectionFailureRestoresStableSession(t *testing.
 			foundAudit = bytes.Contains(item.Data, []byte(`"changes"`)) && bytes.Contains(item.Data, []byte(`"items"`))
 		}
 	}
-	if !foundAudit {
-		t.Fatal("projection failure lost the full operation audit item")
+	if foundAudit {
+		t.Fatal("invalid model output reached the operation result audit")
 	}
 }
