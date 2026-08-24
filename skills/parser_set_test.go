@@ -55,6 +55,61 @@ func TestLoadSetParsesAndSnapshotsValidSkill(t *testing.T) {
 	}
 }
 
+type closeFailingArtifactFS struct {
+	fs.FS
+	err   error
+	calls int
+}
+
+func (filesystem *closeFailingArtifactFS) closeArtifactFS() error {
+	filesystem.calls++
+	return filesystem.err
+}
+
+func TestLoadSetReturnsAllOwnedArtifactCloseErrors(t *testing.T) {
+	firstCloseErr := errors.New("close first artifact")
+	secondCloseErr := errors.New("close second artifact")
+	first := &closeFailingArtifactFS{
+		FS:  fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte("invalid")}},
+		err: firstCloseErr,
+	}
+	second := &closeFailingArtifactFS{
+		FS: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte(skillMarkdown(
+			"second", "Second skill.", "Second body.",
+		))}},
+		err: secondCloseErr,
+	}
+	set, err := LoadSet(t.Context(), staticSource{id: "owned", artifacts: []Artifact{
+		{SourceID: "owned", Locator: "first", FS: first},
+		{SourceID: "owned", Locator: "second", FS: second},
+	}})
+	if set != nil || !errors.Is(err, ErrInvalidSkill) || !errors.Is(err, firstCloseErr) || !errors.Is(err, secondCloseErr) {
+		t.Fatalf("set=%v error=%v, want primary parse error joined with both close errors", set, err)
+	}
+	if first.calls != 1 || second.calls != 1 {
+		t.Fatalf("close calls first=%d second=%d, want exactly one each", first.calls, second.calls)
+	}
+}
+
+func TestLoadSetReturnsOwnedArtifactCloseErrorAfterSuccessfulCopy(t *testing.T) {
+	closeErr := errors.New("close copied artifact")
+	filesystem := &closeFailingArtifactFS{
+		FS: fstest.MapFS{"SKILL.md": &fstest.MapFile{Data: []byte(skillMarkdown(
+			"closable", "Closable skill.", "Closable body.",
+		))}},
+		err: closeErr,
+	}
+	set, err := LoadSet(t.Context(), staticSource{id: "owned", artifacts: []Artifact{{
+		SourceID: "owned", Locator: "closable", FS: filesystem,
+	}}})
+	if set != nil || !errors.Is(err, closeErr) {
+		t.Fatalf("set=%v error=%v, want close failure", set, err)
+	}
+	if filesystem.calls != 1 {
+		t.Fatalf("close calls=%d, want exactly one", filesystem.calls)
+	}
+}
+
 func TestLoadSetRejectsInvalidSkillMarkdown(t *testing.T) {
 	tests := []struct {
 		name  string

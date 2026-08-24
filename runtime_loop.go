@@ -418,8 +418,8 @@ func (r *Runtime) initializeAgentTranscript(
 	state *agentState,
 	approvalResume *ApprovalResume,
 ) ([]ModelInputItem, string, error) {
-	transcript := cloneModelInputItems(state.transcript)
 	if approvalResume == nil {
+		transcript := cloneModelInputItems(state.transcript)
 		transcript = append(transcript, ModelInputItem{
 			Type: ModelInputUserMessage, Text: input.User,
 			Attachments: cloneModelInputAttachments(input.Attachments),
@@ -427,7 +427,7 @@ func (r *Runtime) initializeAgentTranscript(
 		return transcript, "", nil
 	}
 	transcript, terminalResponse, err := r.resumeApprovedOperation(
-		ctx, run, input, state, transcript, approvalResume,
+		ctx, run, input, state, approvalResume,
 	)
 	if err != nil || terminalResponse == "" {
 		return transcript, terminalResponse, err
@@ -521,17 +521,16 @@ func (r *Runtime) handleAgentResponse(
 }
 
 func modelResponseText(response *ModelResponse) (string, error) {
-	output := strings.TrimSpace(response.OutputText)
-	if output == "" {
-		output = strings.TrimSpace(response.Refusal)
+	if strings.TrimSpace(response.OutputText) != "" {
+		return response.OutputText, nil
 	}
-	if output == "" {
-		return "", fmt.Errorf(
-			"%w: response has neither output text, refusal, nor function calls (finish_reason=%q)",
-			ErrInvalidModelOutput, response.FinishReason,
-		)
+	if strings.TrimSpace(response.Refusal) != "" {
+		return response.Refusal, nil
 	}
-	return output, nil
+	return "", fmt.Errorf(
+		"%w: response has neither output text, refusal, nor function calls (finish_reason=%q)",
+		ErrInvalidModelOutput, response.FinishReason,
+	)
 }
 
 func appendTrustedHostContext(instructions, trusted string) string {

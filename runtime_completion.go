@@ -33,7 +33,7 @@ func applyTerminalOperationResult(run *RunRecord, raw json.RawMessage) (string, 
 	if len(run.Artifacts) == 0 {
 		run.Artifacts = cloneResultArtifacts(terminal.Artifacts)
 	}
-	return strings.TrimSpace(terminal.FinalResponse), nil
+	return terminal.FinalResponse, nil
 }
 
 func terminalOperationContinues(raw json.RawMessage) (bool, error) {

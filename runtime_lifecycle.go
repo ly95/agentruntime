@@ -185,16 +185,21 @@ func normalizeRuntimeInput(input Input) (Input, error) {
 	if err := validateUTF8Boundary("runtime input", boundary); err != nil {
 		return Input{}, err
 	}
-	if input.RunID != "" {
-		if err := validateRuntimeIdentity(input.RunID, "run id"); err != nil {
-			return Input{}, err
+	for _, identity := range []struct {
+		value string
+		kind  string
+	}{
+		{value: input.RunID, kind: "run id"},
+		{value: input.SessionID, kind: "session id"},
+		{value: input.IdempotencyKey, kind: "idempotency key"},
+		{value: input.IdempotencyScope, kind: "idempotency scope"},
+	} {
+		if identity.value != "" {
+			if err := validateRuntimeIdentity(identity.value, identity.kind); err != nil {
+				return Input{}, err
+			}
 		}
 	}
-	input.RunID = strings.TrimSpace(input.RunID)
-	input.User = strings.TrimSpace(input.User)
-	input.SessionID = strings.TrimSpace(input.SessionID)
-	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
-	input.IdempotencyScope = strings.TrimSpace(input.IdempotencyScope)
 	input.TrustedContext = strings.TrimSpace(input.TrustedContext)
 	if input.SessionID != "" {
 		input.IdempotencyScope = ""
@@ -213,7 +218,7 @@ func normalizeRuntimeInput(input Input) (Input, error) {
 		input.TrustedContext = string(framed)
 	}
 	input.Attachments = cloneModelInputAttachments(input.Attachments)
-	if input.User == "" {
+	if strings.TrimSpace(input.User) == "" {
 		return Input{}, errors.New("agent: input user text is required")
 	}
 	for index := range input.Attachments {
@@ -448,11 +453,11 @@ func (r *Runtime) prepareApprovalResume(
 	state *agentState,
 	input Input,
 ) (*ApprovalResume, error) {
-	if r.approvalResumer == nil {
-		if state.pendingApprovalDigest != "" {
-			return nil, fmt.Errorf("%w: waiting run %s requires a durable approval resumer", ErrApprovalRequired, run.ID)
-		}
+	if state.pendingApprovalDigest == "" {
 		return nil, nil
+	}
+	if r.approvalResumer == nil {
+		return nil, fmt.Errorf("%w: waiting run %s requires a durable approval resumer", ErrApprovalRequired, run.ID)
 	}
 	resume, err := r.approvalResumer.ResumeApproval(ctx, run.ID)
 	if err != nil {
@@ -583,6 +588,9 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 	// Bind every downstream digest and persistence boundary to the one runtime-
 	// selected identity, including when the caller omitted the optional RunID.
 	input.RunID = run.ID
+	state.pendingApprovalDigest = run.PendingApprovalDigest
+	active := r.startActiveRunLease(ctx, &run, state)
+	defer active.stop()
 	r.emit(Event{Type: EventRunStarted, RunID: run.ID, SessionID: run.SessionID})
 	mcpInfo := r.mcp.ServerInfo()
 	r.emit(Event{
@@ -590,9 +598,6 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 		MCPServer: mcpInfo.Name, MCPVersion: mcpInfo.Version,
 		MCPProtocol: mcpInfo.ProtocolVersion, MCPToolCount: len(r.toolSnapshot),
 	})
-	state.pendingApprovalDigest = run.PendingApprovalDigest
-	active := r.startActiveRunLease(ctx, &run, state)
-	defer active.stop()
 	stableState := captureRunState(state)
 	approvalResume, err := r.prepareApprovalResume(active.runContext, &run, state, input)
 	if err != nil {
@@ -998,6 +1003,9 @@ func validateRunHandle(
 	}
 	if session != nil && session.Revision != handle.SessionRevision {
 		return fmt.Errorf("agent: run store returned session revision %d with handle revision %d", session.Revision, handle.SessionRevision)
+	}
+	if session != nil && handle.SessionRevision == ^uint64(0) {
+		return errors.New("agent: run store returned a session revision that cannot advance")
 	}
 	return nil
 }

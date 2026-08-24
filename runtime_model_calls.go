@@ -10,7 +10,7 @@ import (
 	"github.com/ly95/agentruntime/skills"
 )
 
-func (r *Runtime) resumeApprovedOperation(ctx context.Context, run *RunRecord, input Input, state *agentState, transcript []ModelInputItem, resume *ApprovalResume) ([]ModelInputItem, string, error) {
+func (r *Runtime) resumeApprovedOperation(ctx context.Context, run *RunRecord, input Input, state *agentState, resume *ApprovalResume) ([]ModelInputItem, string, error) {
 	if resume == nil || resume.Pending || strings.TrimSpace(resume.ID) == "" || strings.TrimSpace(resume.ExecutionID) == "" || strings.TrimSpace(resume.Operation) == "" || strings.TrimSpace(resume.ResponseID) == "" {
 		return nil, "", fmt.Errorf("%w: incomplete approval resume state", ErrInvalidModelOutput)
 	}
@@ -25,7 +25,7 @@ func (r *Runtime) resumeApprovedOperation(ctx context.Context, run *RunRecord, i
 	if inputDigest != checkpoint.InputDigest {
 		return nil, "", fmt.Errorf("%w: approval %s input changed", ErrOperationPlanChanged, resume.ID)
 	}
-	transcript = cloneModelInputItems(checkpoint.Transcript)
+	transcript := cloneModelInputItems(checkpoint.Transcript)
 	if err := restoreCurrentApprovalInput(transcript, input); err != nil {
 		return nil, "", fmt.Errorf("%w: approval %s current input changed: %v", ErrOperationPlanChanged, resume.ID, err)
 	}
@@ -156,7 +156,7 @@ func resolveResumedTerminalResult(
 	if err != nil {
 		return nil, "", fmt.Errorf("agent: decode resumed terminal operation result: %w", err)
 	}
-	if terminalResponse == "" {
+	if strings.TrimSpace(terminalResponse) == "" {
 		return nil, "", fmt.Errorf("%w: terminal operation %q returned no final response", ErrInvalidModelOutput, operation.call.Name)
 	}
 	return transcript, terminalResponse, nil
@@ -399,7 +399,7 @@ func (r *Runtime) executeCalls(ctx context.Context, run *RunRecord, input Input,
 			if err != nil {
 				return nil, "", fmt.Errorf("agent: decode terminal operation result: %w", err)
 			}
-			if response == "" {
+			if strings.TrimSpace(response) == "" {
 				return nil, "", fmt.Errorf("%w: terminal operation %q returned no final response", ErrInvalidModelOutput, prepared[i].call.Name)
 			}
 			terminalResponses = append(terminalResponses, response)
@@ -590,8 +590,7 @@ func combineTerminalResponses(responses []string) string {
 	unique := make([]string, 0, len(responses))
 	seen := make(map[string]struct{}, len(responses))
 	for _, response := range responses {
-		response = strings.TrimSpace(response)
-		if response == "" {
+		if strings.TrimSpace(response) == "" {
 			continue
 		}
 		if _, duplicate := seen[response]; duplicate {

@@ -55,24 +55,23 @@ func (source *CodexPluginSource) resolveWithLimits(ctx context.Context, limits L
 	artifacts := make([]Artifact, 0)
 	for _, directory := range source.pluginDirectories {
 		if err := ctx.Err(); err != nil {
-			closeOwnedArtifacts(artifacts)
-			return nil, err
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		if len(artifacts) >= limits.MaxSkills {
-			closeOwnedArtifacts(artifacts)
-			return nil, fmt.Errorf("%w: Codex Plugin source contains more than %d Skills", ErrLimitExceeded, limits.MaxSkills)
+			return nil, errors.Join(
+				fmt.Errorf("%w: Codex Plugin source contains more than %d Skills", ErrLimitExceeded, limits.MaxSkills),
+				closeOwnedArtifacts(artifacts),
+			)
 		}
 		configured, descriptor, err := configuredDirectory(directory, "Codex Plugin")
 		if err != nil {
-			closeOwnedArtifacts(artifacts)
-			return nil, err
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		pluginArtifacts, err := source.resolvePlugin(
 			configured, &sharedRoot{root: descriptor}, limits, limits.MaxSkills-len(artifacts),
 		)
 		if err != nil {
-			closeOwnedArtifacts(artifacts)
-			return nil, err
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		artifacts = append(artifacts, pluginArtifacts...)
 	}
@@ -90,12 +89,17 @@ func (source *CodexPluginSource) resolvePlugin(
 	limits Limits,
 	maximumSkills int,
 ) (artifacts []Artifact, err error) {
+	ownedArtifacts := make([]Artifact, 0)
 	succeeded := false
 	defer func() {
-		if !succeeded {
-			closeOwnedArtifacts(artifacts)
+		if abortErr := rooted.abort(); abortErr != nil {
+			err = errors.Join(err, fmt.Errorf("skills: close Codex Plugin root: %w", abortErr))
+			succeeded = false
 		}
-		_ = rooted.abort()
+		if !succeeded {
+			err = errors.Join(err, closeOwnedArtifacts(ownedArtifacts))
+			artifacts = nil
+		}
 	}()
 	pluginFS := rooted.FS()
 	manifestBytes, err := readFSFile(pluginFS, ".codex-plugin/plugin.json", limits.MaxFileBytes)
@@ -127,10 +131,11 @@ func (source *CodexPluginSource) resolvePlugin(
 		if err != nil {
 			return nil, err
 		}
-		artifacts = []Artifact{{
+		ownedArtifacts = []Artifact{{
 			SourceID: source.id, Locator: configured + "#" + skillsRelative,
 			Revision: manifest.Version, FS: artifactFS,
 		}}
+		artifacts = ownedArtifacts
 		succeeded = true
 		return artifacts, nil
 	}
@@ -159,21 +164,22 @@ func (source *CodexPluginSource) resolvePlugin(
 		if !present {
 			continue
 		}
-		if len(artifacts) >= maximumSkills {
+		if len(ownedArtifacts) >= maximumSkills {
 			return nil, fmt.Errorf("%w: Codex Plugin source contains more than %d Skills", ErrLimitExceeded, limits.MaxSkills)
 		}
 		artifactFS, err := rooted.sub(skillRelative)
 		if err != nil {
 			return nil, err
 		}
-		artifacts = append(artifacts, Artifact{
+		ownedArtifacts = append(ownedArtifacts, Artifact{
 			SourceID: source.id, Locator: configured + "#" + skillRelative,
 			Revision: manifest.Version, FS: artifactFS,
 		})
 	}
-	if len(artifacts) == 0 {
+	if len(ownedArtifacts) == 0 {
 		return nil, fmt.Errorf("%w: Codex Plugin contains no skills", ErrInvalidSource)
 	}
+	artifacts = ownedArtifacts
 	succeeded = true
 	return artifacts, nil
 }

@@ -2,6 +2,7 @@ package skills
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -50,13 +51,11 @@ func (source *LocalSource) resolveWithLimits(ctx context.Context, limits Limits)
 	artifacts := make([]Artifact, 0, len(source.directories))
 	for _, directory := range source.directories {
 		if err := ctx.Err(); err != nil {
-			closeOwnedArtifacts(artifacts)
-			return nil, err
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		configured, root, err := configuredDirectory(directory, "local Skill")
 		if err != nil {
-			closeOwnedArtifacts(artifacts)
-			return nil, err
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		filesystem := &rootArtifactFS{root: root}
 		artifacts = append(artifacts, Artifact{

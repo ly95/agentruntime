@@ -653,13 +653,13 @@ func equalOptionalJSON(left, right json.RawMessage) bool {
 func cloneOperationResult(result OperationResult) OperationResult {
 	return OperationResult{
 		Output: append(json.RawMessage(nil), result.Output...), Receipt: append(json.RawMessage(nil), result.Receipt...),
-		FinalResponse: strings.TrimSpace(result.FinalResponse), Artifacts: cloneResultArtifacts(result.Artifacts), Continue: result.Continue,
+		FinalResponse: result.FinalResponse, Artifacts: cloneResultArtifacts(result.Artifacts), Continue: result.Continue,
 	}
 }
 
 func equalOperationResult(left, right OperationResult) bool {
 	return jsonSemanticallyEqual(left.Output, right.Output) && jsonSemanticallyEqual(left.Receipt, right.Receipt) &&
-		strings.TrimSpace(left.FinalResponse) == strings.TrimSpace(right.FinalResponse) && left.Continue == right.Continue &&
+		left.FinalResponse == right.FinalResponse && left.Continue == right.Continue &&
 		equalResultArtifacts(left.Artifacts, right.Artifacts)
 }
 

@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -256,8 +257,12 @@ func (root *sharedRoot) abort() error {
 	return root.root.close()
 }
 
-func closeOwnedArtifacts(artifacts []Artifact) {
-	for _, artifact := range artifacts {
-		_ = artifact.Close()
+func closeOwnedArtifacts(artifacts []Artifact) error {
+	var result error
+	for index, artifact := range artifacts {
+		if err := artifact.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("skills: close artifact %d %q: %w", index, artifact.Locator, err))
+		}
 	}
+	return result
 }

@@ -80,62 +80,69 @@ func LoadSetWithLimits(ctx context.Context, limits Limits, sources ...Source) (*
 
 		artifacts, err := resolveSource(ctx, source, sourceLimits)
 		if err != nil {
-			closeOwnedArtifacts(artifacts)
 			var markdownLimit *skillMarkdownLimitError
 			if remainingMarkdownBytes < limits.MaxSkillMarkdownBytes && errors.As(err, &markdownLimit) {
-				return nil, fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+				err = fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+			} else {
+				err = fmt.Errorf("skills: source %q: %w", sourceID, err)
 			}
-			return nil, fmt.Errorf("skills: source %q: %w", sourceID, err)
+			return nil, errors.Join(err, closeOwnedArtifacts(artifacts))
 		}
 		if len(artifacts) == 0 {
 			return nil, fmt.Errorf("%w: source %q returned no artifacts", ErrInvalidSource, sourceID)
 		}
-		defer closeOwnedArtifacts(artifacts)
-		for artifactIndex, artifact := range artifacts {
-			if len(loaded) >= limits.MaxSkills {
-				return nil, fmt.Errorf("%w: SkillSet contains more than %d skills", ErrLimitExceeded, limits.MaxSkills)
-			}
-			if artifact.SourceID != sourceID {
-				return nil, fmt.Errorf("%w: source %q artifact %d SourceID does not match", ErrInvalidArtifact, sourceID, artifactIndex)
-			}
-			if err := validateNormalizedIdentity("locator", artifact.Locator); err != nil {
-				return nil, fmt.Errorf("%w: source %q artifact %d: %v", ErrInvalidArtifact, sourceID, artifactIndex, err)
-			}
-			if err := validateOptionalNormalizedIdentity("revision", artifact.Revision); err != nil {
-				return nil, fmt.Errorf("%w: source %q artifact %d: %v", ErrInvalidArtifact, sourceID, artifactIndex, err)
-			}
-			if isNilValue(artifact.FS) {
-				return nil, fmt.Errorf("%w: source %q artifact %d filesystem is required", ErrInvalidArtifact, sourceID, artifactIndex)
-			}
-
-			remainingMarkdownBytes = limits.MaxTotalSkillMarkdownBytes - totalSkillMarkdownBytes
-			if remainingMarkdownBytes <= 0 {
-				return nil, fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
-			}
-			artifactLimits := limits
-			aggregateConstrained := remainingMarkdownBytes < artifactLimits.MaxSkillMarkdownBytes
-			if aggregateConstrained {
-				artifactLimits.MaxSkillMarkdownBytes = remainingMarkdownBytes
-			}
-			skill, markdownBytes, err := parseArtifact(artifact, artifactLimits)
-			if err != nil {
-				var markdownLimit *skillMarkdownLimitError
-				if aggregateConstrained && errors.As(err, &markdownLimit) {
-					return nil, fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+		if err := func() (result error) {
+			defer func() {
+				result = errors.Join(result, closeOwnedArtifacts(artifacts))
+			}()
+			for artifactIndex, artifact := range artifacts {
+				if len(loaded) >= limits.MaxSkills {
+					return fmt.Errorf("%w: SkillSet contains more than %d skills", ErrLimitExceeded, limits.MaxSkills)
 				}
-				return nil, fmt.Errorf("skills: source %q artifact %d: %w", sourceID, artifactIndex, err)
+				if artifact.SourceID != sourceID {
+					return fmt.Errorf("%w: source %q artifact %d SourceID does not match", ErrInvalidArtifact, sourceID, artifactIndex)
+				}
+				if err := validateNormalizedIdentity("locator", artifact.Locator); err != nil {
+					return fmt.Errorf("%w: source %q artifact %d: %v", ErrInvalidArtifact, sourceID, artifactIndex, err)
+				}
+				if err := validateOptionalNormalizedIdentity("revision", artifact.Revision); err != nil {
+					return fmt.Errorf("%w: source %q artifact %d: %v", ErrInvalidArtifact, sourceID, artifactIndex, err)
+				}
+				if isNilValue(artifact.FS) {
+					return fmt.Errorf("%w: source %q artifact %d filesystem is required", ErrInvalidArtifact, sourceID, artifactIndex)
+				}
+
+				remainingMarkdownBytes = limits.MaxTotalSkillMarkdownBytes - totalSkillMarkdownBytes
+				if remainingMarkdownBytes <= 0 {
+					return fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+				}
+				artifactLimits := limits
+				aggregateConstrained := remainingMarkdownBytes < artifactLimits.MaxSkillMarkdownBytes
+				if aggregateConstrained {
+					artifactLimits.MaxSkillMarkdownBytes = remainingMarkdownBytes
+				}
+				skill, markdownBytes, err := parseArtifact(artifact, artifactLimits)
+				if err != nil {
+					var markdownLimit *skillMarkdownLimitError
+					if aggregateConstrained && errors.As(err, &markdownLimit) {
+						return fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+					}
+					return fmt.Errorf("skills: source %q artifact %d: %w", sourceID, artifactIndex, err)
+				}
+				if markdownBytes > limits.MaxTotalSkillMarkdownBytes-totalSkillMarkdownBytes {
+					return fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
+				}
+				totalSkillMarkdownBytes += markdownBytes
+				if existing, exists := seenNames[skill.name]; exists {
+					return fmt.Errorf("%w: skill %q from source %q conflicts with source %q", ErrNameConflict, skill.name, sourceID, existing.sourceID)
+				}
+				seenNames[skill.name] = skill
+				loaded = append(loaded, skill)
 			}
-			if markdownBytes > limits.MaxTotalSkillMarkdownBytes-totalSkillMarkdownBytes {
-				return nil, fmt.Errorf("%w: total SKILL.md bytes exceed %d", ErrLimitExceeded, limits.MaxTotalSkillMarkdownBytes)
-			}
-			totalSkillMarkdownBytes += markdownBytes
-			if existing, exists := seenNames[skill.name]; exists {
-				return nil, fmt.Errorf("%w: skill %q from source %q conflicts with source %q", ErrNameConflict, skill.name, sourceID, existing.sourceID)
-			}
-			seenNames[skill.name] = skill
-			loaded = append(loaded, skill)
+			return nil
+		}(); err != nil {
+			return nil, err
 		}
-		closeOwnedArtifacts(artifacts)
 	}
 
 	sort.Slice(loaded, func(left, right int) bool {
