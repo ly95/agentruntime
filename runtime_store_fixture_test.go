@@ -41,26 +41,9 @@ func createRunForTest(ctx context.Context, store RunStore, request CreateRunRequ
 	return started, err
 }
 
-func resumeRunForTest(ctx context.Context, store RunStore, request ResumeRunRequest) (ResumedRun, error) {
-	var resumed ResumedRun
-	err := store.ResumeRunV3(ctx, request, func(candidate ResumedRun) error {
-		resumed = candidate
-		return nil
-	})
-	return resumed, err
-}
-
 type appendFailingStore struct {
 	recordingStore
 	failType ItemType
-	err      error
-}
-
-type nthItemFailingStore struct {
-	recordingStore
-	failType ItemType
-	failAt   int
-	seen     int
 	err      error
 }
 
@@ -676,16 +659,6 @@ func (s *appendFailingStore) AppendItem(ctx context.Context, item ItemRecord) er
 	return s.recordingStore.AppendItem(ctx, item)
 }
 
-func (s *nthItemFailingStore) AppendItem(ctx context.Context, item ItemRecord) error {
-	if item.Type == s.failType {
-		s.seen++
-		if s.seen == s.failAt {
-			return s.err
-		}
-	}
-	return s.recordingStore.AppendItem(ctx, item)
-}
-
 func (s *mutatingAppendStore) AppendItem(ctx context.Context, item ItemRecord) error {
 	if item.Type == ItemTypeOperationResult && len(item.Data) > 0 {
 		item.Data[0] = '['
@@ -694,16 +667,26 @@ func (s *mutatingAppendStore) AppendItem(ctx context.Context, item ItemRecord) e
 }
 
 func (s *mutatingBeginStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+	stored, err := clonePersistentRunRecord(request.Run)
+	if err != nil {
+		return err
+	}
 	if nested, ok := request.Run.Input.Metadata["nested"].(map[string]any); ok {
 		nested["value"] = "store-mutated"
 	}
+	request.Run = stored
 	return s.recordingStore.CreateRunV3(ctx, request, accept)
 }
 
 func (s *mutatingBeginStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+	stored, err := clonePersistentRunRecord(request.Run)
+	if err != nil {
+		return err
+	}
 	if nested, ok := request.Run.Input.Metadata["nested"].(map[string]any); ok {
 		nested["value"] = "store-mutated"
 	}
+	request.Run = stored
 	return s.recordingStore.ResumeRunV3(ctx, request, accept)
 }
 

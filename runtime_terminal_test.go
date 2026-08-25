@@ -96,6 +96,7 @@ func reconcileMissingTerminalResponse(
 			Output: json.RawMessage(`{"done":true}`), Receipt: json.RawMessage(`{"version":1}`),
 		},
 		Actor: "test-host", Message: "host returned an incomplete terminal result",
+		Evidence: json.RawMessage(`{"attempt_committed":true}`),
 	}); !errors.Is(err, ErrInvalidReconciliation) || !strings.Contains(err.Error(), "returned no final response") {
 		t.Fatalf("incomplete ReconcileOperation error=%v, want invalid reconciliation", err)
 	}
@@ -113,6 +114,7 @@ func reconcileMissingTerminalResponse(
 		Action: OperationReconciliationComplete, Result: recoveredResult,
 		Verification: &VerificationResult{Confirmed: true, Message: "host verified", Evidence: json.RawMessage(`{"version":1}`)},
 		Actor:        "test-host", Message: "host recovered the terminal response",
+		Evidence: json.RawMessage(`{"attempt_committed":true,"version":1}`),
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
 	}
@@ -226,8 +228,8 @@ func TestRuntimeCarriesTerminalOperationArtifactsToRunStore(t *testing.T) {
 	}
 	if len(result.Artifacts) != 1 || result.Artifacts[0].Type != "image_result" ||
 		string(result.Artifacts[0].Data) != `{"generation_id":"exec-1"}` ||
-		string(result.Artifacts[0].InternalData) != `{"storage_key":"private/change-set-plan"}` {
-		t.Fatalf("result artifacts=%+v", result.Artifacts)
+		len(result.Artifacts[0].InternalData) != 0 || len(result.Artifacts[0].SessionSummary) != 0 {
+		t.Fatalf("public result artifacts=%+v", result.Artifacts)
 	}
 	if len(store.completed) != 1 || len(store.completed[0].Artifacts) != 1 || store.completed[0].Artifacts[0].Type != "image_result" {
 		t.Fatalf("completed runs=%+v", store.completed)

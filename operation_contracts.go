@@ -450,16 +450,17 @@ type ApprovalResumer interface {
 	ResumeApproval(ctx context.Context, runID string) (*ApprovalResume, error)
 }
 
-type ApproverFunc func(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error)
-
-func (f ApproverFunc) RequestApproval(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error) {
-	return f(ctx, req)
-}
-
+// ApprovalResumerFunc adapts a function to ApprovalResumer.
 type ApprovalResumerFunc func(ctx context.Context, runID string) (*ApprovalResume, error)
 
 func (f ApprovalResumerFunc) ResumeApproval(ctx context.Context, runID string) (*ApprovalResume, error) {
 	return f(ctx, runID)
+}
+
+type ApproverFunc func(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error)
+
+func (f ApproverFunc) RequestApproval(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error) {
+	return f(ctx, req)
 }
 
 func normalizeNames(values []string) []string {

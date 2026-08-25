@@ -237,7 +237,8 @@ func TestOperationReconcilerSettlesUnknownExecutionWithoutRuntimeDependencies(t 
 	if err := reconciler.ReconcileOperation(t.Context(), ReconcileOperationRequest{
 		ExecutionID: execution.ID, ExpectedAttemptID: execution.AttemptID,
 		Action: OperationReconciliationRetry, Actor: "operator",
-		Message: "host confirmed no side effect",
+		Message:  "host confirmed no side effect",
+		Evidence: json.RawMessage(`{"applied":false}`),
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
 	}
@@ -475,8 +476,8 @@ func TestRuntimeAmbiguousCompletionProofRequiresExactConcurrentTransition(t *tes
 	runtime := &Runtime{
 		operations: operations, executions: store,
 		now: func() time.Time { return time.Unix(200, 0) },
-		newID: func() string {
-			return fmt.Sprintf("concurrent-transition-%d", identity.Add(1))
+		newID: func() (string, error) {
+			return fmt.Sprintf("concurrent-transition-%d", identity.Add(1)), nil
 		},
 		cleanupTimeout: defaultDetachedCleanupTimeout,
 	}

@@ -338,7 +338,12 @@ func (r *Runtime) completeModel(ctx context.Context, runID, sessionID string, st
 		return nil, modelCallID, correlateModelCallError(modelCallID, appendErr)
 	}
 	recordAuditedModelResponseIdentity(state, identity)
-	r.emit(Event{Type: EventModelCompleted, RunID: runID, SessionID: sessionID, ModelCallID: modelCallID, ResponseID: resp.ID})
+	r.emit(Event{
+		Type: EventModelCompleted, RunID: runID, SessionID: sessionID,
+		ModelCallID: modelCallID, ResponseID: resp.ID,
+		InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens,
+		TotalTokens: resp.Usage.TotalTokens,
+	})
 	return resp, modelCallID, nil
 }
 
@@ -549,7 +554,11 @@ func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentSt
 		if err != nil {
 			return nil, err
 		}
-		if err := r.runStore.FinishRun(ctx, FinishRunRequest{Handle: state.lease.Handle(), Run: storedRun, Session: session}); err != nil {
+		request := FinishRunRequest{Handle: state.lease.Handle(), Run: storedRun, Session: session}
+		if err := request.Validate(); err != nil {
+			return nil, err
+		}
+		if err := r.runStore.FinishRun(ctx, request); err != nil {
 			return nil, err
 		}
 	}
@@ -557,11 +566,12 @@ func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentSt
 	return &Result{
 		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
 		LastResponseID: state.lastResponseID, Output: output,
-		Artifacts: cloneResultArtifacts(run.Artifacts),
+		Artifacts: publicResultArtifacts(run.Artifacts),
 	}, nil
 }
 
 func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState) (*Result, error) {
+	pending := pendingApprovalSummary(state)
 	run.Status = RunStatusWaitingUser
 	if state.pendingApproval != nil {
 		state.pendingApprovalDigest = state.pendingApproval.Digest
@@ -581,19 +591,65 @@ func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState)
 		if err != nil {
 			return nil, err
 		}
-		if err := r.runStore.FinishRun(ctx, FinishRunRequest{
+		request := FinishRunRequest{
 			Handle: state.lease.Handle(), Run: storedRun, Session: session,
 			PendingApproval: state.pendingApproval,
-		}); err != nil {
+		}
+		if err := request.Validate(); err != nil {
+			return nil, err
+		}
+		if err := r.runStore.FinishRun(ctx, request); err != nil {
 			return nil, err
 		}
 		state.pendingApproval = nil
 	}
-	r.emit(Event{Type: EventRunWaitingUser, RunID: run.ID, SessionID: run.SessionID})
+	event := Event{Type: EventRunWaitingUser, RunID: run.ID, SessionID: run.SessionID}
+	if pending != nil {
+		event.ApprovalID = pending.ID
+		event.ApprovalDigest = pending.Digest
+		event.ApprovalReason = pending.Reason
+		event.Text = pending.Reason
+		event.ApprovalPreview = append(json.RawMessage(nil), pending.Preview...)
+	}
+	r.emit(event)
 	return &Result{
 		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
 		PendingApprovalDigest: run.PendingApprovalDigest,
+		PendingApproval:       clonePendingApprovalSummary(pending),
 	}, nil
+}
+
+func pendingApprovalSummary(state *agentState) *PendingApprovalSummary {
+	if state == nil {
+		return nil
+	}
+	pending := state.pendingApproval
+	if pending == nil {
+		pending = state.resumedApproval
+	}
+	if pending == nil {
+		return nil
+	}
+	reason := strings.TrimSpace(pending.Decision.Reason)
+	if reason == "" {
+		reason = strings.TrimSpace(pending.Request.Reason)
+	}
+	return &PendingApprovalSummary{
+		ID: pending.Decision.ID, Digest: pending.Digest,
+		Operation:   pending.Request.Operation.Operation.Name,
+		ExecutionID: pending.Request.Operation.ExecutionID,
+		Reason:      RedactText(reason, 512),
+		Preview:     append(json.RawMessage(nil), pending.Request.Preview...),
+	}
+}
+
+func clonePendingApprovalSummary(summary *PendingApprovalSummary) *PendingApprovalSummary {
+	if summary == nil {
+		return nil
+	}
+	out := *summary
+	out.Preview = append(json.RawMessage(nil), summary.Preview...)
+	return &out
 }
 
 func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState, cause error) error {
@@ -617,28 +673,30 @@ func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState,
 	callID := ""
 	executionID := ""
 	attemptID := ""
-	if modelErr, ok := errors.AsType[*modelCallError](cause); ok {
+	var modelErr *modelCallError
+	if errors.As(cause, &modelErr) {
 		modelCallID = modelErr.modelCallID
 	}
-	if operationErr, ok := errors.AsType[*operationCallError](cause); ok {
+	var operationErr *operationCallError
+	if errors.As(cause, &operationErr) {
 		callID = operationErr.callID
 		executionID = operationErr.executionID
 		attemptID = operationErr.attemptID
 	}
+	var failureItem *ItemRecord
 	data, marshalErr := json.Marshal(map[string]string{"error": cause.Error()})
 	if marshalErr != nil {
 		cause = errors.Join(cause, marshalErr)
+		run.FailureAuditStatus = FailureAuditMissing
 	} else {
 		itemID, idErr := r.nextGeneratedID(ctx, "error item id")
 		if idErr != nil {
 			cause = errors.Join(cause, idErr)
+			run.FailureAuditStatus = FailureAuditMissing
 		} else {
-			cleanupCtx, cancel := r.detachedCleanupContext(ctx)
-			err := r.appendItem(cleanupCtx, ItemRecord{ID: itemID, RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeError, ModelCallID: modelCallID, CallID: callID, ExecutionID: executionID, AttemptID: attemptID, Data: data, Error: run.Error, CreatedAt: r.now()})
-			cancel()
-			if err != nil {
-				cause = errors.Join(cause, err)
-			}
+			item := ItemRecord{ID: itemID, RunID: run.ID, SessionID: run.SessionID, Type: ItemTypeError, ModelCallID: modelCallID, CallID: callID, ExecutionID: executionID, AttemptID: attemptID, Data: data, Error: run.Error, CreatedAt: r.now()}
+			failureItem = &item
+			run.FailureAuditStatus = FailureAuditCommitted
 		}
 	}
 	run.Error = cause.Error()
@@ -657,8 +715,11 @@ func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState,
 		}
 		err := cloneErr
 		if cloneErr == nil {
-			err = r.runStore.FinishRun(cleanupCtx, FinishRunRequest{Handle: state.lease.Handle(), Run: storedRun, Session: session})
-			err = validateUTF8Error("run store", err)
+			request := FinishRunRequest{Handle: state.lease.Handle(), Run: storedRun, Session: session, FailureItem: failureItem}
+			err = request.Validate()
+			if err == nil {
+				err = validateUTF8Error("run store", r.runStore.FinishRun(cleanupCtx, request))
+			}
 		}
 		cancel()
 		if err != nil {
@@ -679,21 +740,7 @@ func (r *Runtime) detachedCleanupContext(ctx context.Context) (context.Context, 
 
 func (r *Runtime) emit(event Event) {
 	if r.eventSink != nil {
-		event.Data = append(json.RawMessage(nil), event.Data...)
-		event.ApprovalPreview = append(json.RawMessage(nil), event.ApprovalPreview...)
-		if event.Chunk != nil {
-			chunk := *event.Chunk
-			if event.Chunk.SequenceNumber != nil {
-				sequence := *event.Chunk.SequenceNumber
-				chunk.SequenceNumber = &sequence
-			}
-			if event.Chunk.OutputIndex != nil {
-				index := *event.Chunk.OutputIndex
-				chunk.OutputIndex = &index
-			}
-			event.Chunk = &chunk
-		}
-		r.eventSink(event)
+		r.eventSink(cloneRuntimeEvent(event))
 	}
 }
 

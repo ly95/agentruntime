@@ -158,6 +158,7 @@ type leaseGuard struct {
 	renewalInterval time.Duration
 	cancelGrace     time.Duration
 	finalizeGrace   time.Duration
+	onRenew         func(RunHandle)
 }
 
 func newLeaseGuard(store RunStore, handle RunHandle, ttl, renewalInterval, cancelGrace time.Duration) *leaseGuard {
@@ -313,6 +314,9 @@ func (guard *leaseGuard) renewLease(ctx context.Context) error {
 	}
 	if err != nil {
 		return fmt.Errorf("%w: renew session %s: %w", ErrSessionLeaseLost, handle.SessionID, err)
+	}
+	if guard.onRenew != nil {
+		guard.onRenew(guard.Handle())
 	}
 	return nil
 }

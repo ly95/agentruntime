@@ -45,13 +45,6 @@ func decodeOpenAIRawObjectChecked(raw json.RawMessage, label string, value any) 
 	return fields, nil
 }
 
-func validateOpenAIRawAgainstValue(raw json.RawMessage, label string, value any) error {
-	if value == nil {
-		return fmt.Errorf("%w: OpenAI %s has no supported schema variant", ErrInvalidModelOutput, label)
-	}
-	return validateOpenAIRawAgainstType(raw, label, reflect.TypeOf(value))
-}
-
 var openAIStringTypeDomains = map[string][]string{
 	"ComputerUsePreviewToolEnvironment":          {"windows", "mac", "linux", "ubuntu", "browser"},
 	"EasyInputMessagePhase":                      {"commentary", "final_answer"},
@@ -84,21 +77,6 @@ var openAIStringTypeDomains = map[string][]string{
 	"WebSearchPreviewToolType":                   {"web_search_preview", "web_search_preview_2025_03_11"},
 	"WebSearchToolSearchContextSize":             {"low", "medium", "high"},
 	"WebSearchToolType":                          {"web_search", "web_search_2025_08_26"},
-}
-
-var openAIStructStatusDomains = map[string][]string{
-	"ResponseInputItemApplyPatchCall":       {"in_progress", "completed"},
-	"ResponseInputItemApplyPatchCallOutput": {"completed", "failed"},
-	"ResponseInputItemComputerCallOutput":   {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemFunctionCallOutput":   {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemImageGenerationCall":  {"in_progress", "completed", "generating", "failed"},
-	"ResponseInputItemLocalShellCall":       {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemLocalShellCallOutput": {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemMcpCall":              {"in_progress", "completed", "incomplete", "calling", "failed"},
-	"ResponseInputItemShellCall":            {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemShellCallOutput":      {"in_progress", "completed", "incomplete"},
-	"ResponseInputItemToolSearchCall":       {"in_progress", "completed", "incomplete"},
-	"ResponseToolSearchOutputItemParamResp": {"in_progress", "completed", "incomplete"},
 }
 
 // openAISchemaInfo caches per-type JSON schema metadata so per-event validation
@@ -153,10 +131,6 @@ func buildOpenAISchemaInfo(valueType reflect.Type) *openAISchemaInfo {
 		info.fields = append(info.fields, openAISchemaField{jsonName: jsonName, typ: field.Type})
 	}
 	return info
-}
-
-func openAIJSONFieldNames(valueType reflect.Type) map[string]struct{} {
-	return openAISchemaInfoFor(valueType).jsonFields
 }
 
 // validateOpenAIClosedSchema proves that provider-owned JSON uses only fields
@@ -304,20 +278,6 @@ func validateOpenAIClosedSchemaValue(value any, raw json.RawMessage, label strin
 			if err := validateOpenAIClosedSchema(fieldRaw, fmt.Sprintf("%s.%s", label, field.jsonName), field.typ); err != nil {
 				return err
 			}
-		}
-	}
-	return nil
-}
-
-func validateOpenAIUnionVariantFields(raw json.RawMessage, label string, variantType reflect.Type) error {
-	fields, err := decodeOpenAIRawObject(raw, label)
-	if err != nil {
-		return err
-	}
-	allowed := openAIJSONFieldNames(variantType)
-	for name := range fields {
-		if _, isAllowed := allowed[name]; !isAllowed {
-			return fmt.Errorf("%w: OpenAI %s union variant has invalid field %s", ErrInvalidModelOutput, label, name)
 		}
 	}
 	return nil

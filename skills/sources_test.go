@@ -80,6 +80,7 @@ func TestBuiltInSourceResolveRejectsNilContext(t *testing.T) {
 		NewGitHubSource(GitHubSourceConfig{ID: "github"}),
 	}
 	for _, source := range sources {
+		//lint:ignore SA1012 This test verifies that every built-in Source rejects a nil context explicitly.
 		if artifacts, err := source.Resolve(nil); err == nil || artifacts != nil || !errors.Is(err, ErrInvalidSource) {
 			t.Fatalf("source=%T artifacts=%v error=%v", source, artifacts, err)
 		}

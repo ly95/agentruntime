@@ -31,21 +31,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	skill := textskill.New()
-	operations := agentruntime.NewOperationRegistry()
-	if err := skill.Register(operations); err != nil {
-		return fmt.Errorf("install text skill: %w", err)
-	}
 	skillDirectory, err := filepath.Abs("examples/skill/textskill")
 	if err != nil {
 		return fmt.Errorf("resolve text skill directory: %w", err)
+	}
+	result, err := runWithModel(ctx, model, skillDirectory,
+		commandPrompt("Analyze this text with the installed skill: Agent runtimes keep business logic outside the model loop."))
+	if err != nil {
+		return err
+	}
+	fmt.Println(result.Output)
+	return nil
+}
+
+func runWithModel(ctx context.Context, model agentruntime.Model, skillDirectory, prompt string) (*agentruntime.Result, error) {
+	skill := textskill.New()
+	operations := agentruntime.NewOperationRegistry()
+	if err := skill.Register(operations); err != nil {
+		return nil, fmt.Errorf("install text skill: %w", err)
 	}
 	mountedSkills, err := skills.LoadSet(ctx, skills.NewLocalSource(skills.LocalSourceConfig{
 		ID:          "example-local",
 		Directories: []string{skillDirectory},
 	}))
 	if err != nil {
-		return fmt.Errorf("load text skill: %w", err)
+		return nil, fmt.Errorf("load text skill: %w", err)
 	}
 	agent, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{
 		Model:      model,
@@ -65,17 +75,16 @@ func run() error {
 		Executor: skill,
 	})
 	if err != nil {
-		return fmt.Errorf("create runtime: %w", err)
+		return nil, fmt.Errorf("create runtime: %w", err)
 	}
 
 	result, err := agent.Run(ctx, agentruntime.Input{
-		User: commandPrompt("Analyze this text with the installed skill: Agent runtimes keep business logic outside the model loop."),
+		User: prompt,
 	})
 	if err != nil {
-		return fmt.Errorf("run agent: %w", err)
+		return nil, fmt.Errorf("run agent: %w", err)
 	}
-	fmt.Println(result.Output)
-	return nil
+	return result, nil
 }
 
 func newOpenAIModel() (*agentruntime.OpenAIModel, error) {

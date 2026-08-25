@@ -184,7 +184,7 @@ func normalizedRepositoryPath(value string) (string, error) {
 	}
 	for _, component := range strings.Split(value, "/") {
 		if component == ".." {
-			return "", fmt.Errorf("%w: GitHub path must not contain ..", ErrInvalidSource)
+			return "", fmt.Errorf("%w: GitHub path must not contain .. parent components", ErrInvalidSource)
 		}
 		if component == "" || component == "." {
 			return "", fmt.Errorf("%w: GitHub path must be normalized", ErrInvalidSource)
@@ -196,6 +196,7 @@ func normalizedRepositoryPath(value string) (string, error) {
 type safeSourceError struct {
 	message         string
 	classifications []error
+	rateLimit       *GitHubRateLimitError
 }
 
 func (err *safeSourceError) Error() string { return err.message }
@@ -209,14 +210,32 @@ func (err *safeSourceError) Is(target error) bool {
 	return false
 }
 
+func (err *safeSourceError) As(target any) bool {
+	rateLimit, ok := target.(**GitHubRateLimitError)
+	if !ok || err == nil || err.rateLimit == nil {
+		return false
+	}
+	clone := *err.rateLimit
+	*rateLimit = &clone
+	return true
+}
+
 func newSafeSourceError(message string, cause error) error {
 	classifications := []error{ErrInvalidSource}
-	for _, classification := range []error{context.Canceled, context.DeadlineExceeded, fs.ErrNotExist, fs.ErrPermission} {
+	for _, classification := range []error{
+		context.Canceled, context.DeadlineExceeded, fs.ErrNotExist, fs.ErrPermission,
+		ErrInvalidArtifact, ErrLimitExceeded, ErrGitHubRateLimited, ErrGitHubAuthentication,
+	} {
 		if errors.Is(cause, classification) {
 			classifications = append(classifications, classification)
 		}
 	}
-	return &safeSourceError{message: message, classifications: classifications}
+	var rateLimit *GitHubRateLimitError
+	if errors.As(cause, &rateLimit) {
+		clone := *rateLimit
+		rateLimit = &clone
+	}
+	return &safeSourceError{message: message, classifications: classifications, rateLimit: rateLimit}
 }
 
 func newGitHubSnapshot(files []GitHubFile, limits Limits) (*githubSnapshotFS, error) {

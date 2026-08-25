@@ -11,8 +11,9 @@ minimum with explicit release notes.
 
 - Reproducible runtime defects: use the Bug report template.
 - Runtime integration questions: use the Support request template.
-- Store protocol proposals: use the Store adapter template and describe the
-  transaction, isolation, lease, fencing, and idempotency mapping.
+- Store implementations: use the Store adapter template and include the
+  failing `storetest` conformance subtest plus the transaction, isolation,
+  lease, fencing, and idempotency mapping.
 - Security vulnerabilities: follow [SECURITY.md](SECURITY.md) and do not put
   exploit details in a public issue.
 
@@ -24,4 +25,4 @@ host application's responsibility.
 Include the agentruntime version or commit, Go version, provider adapter,
 operation effect, store types, stable error code, and the smallest relevant
 event sequence. Remove credentials, user data, raw approval arguments,
-attachment contents, and provider payloads.
+attachment contents, artifact internal data, and provider payloads.

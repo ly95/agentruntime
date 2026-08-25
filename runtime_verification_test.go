@@ -241,7 +241,7 @@ func mustJSON(value any) json.RawMessage {
 }
 
 func int64Pointer(value int64) *int64 {
-	return new(value)
+	return &value
 }
 
 func BenchmarkRuntimeModelRequestCached(b *testing.B) {

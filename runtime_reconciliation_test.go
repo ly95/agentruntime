@@ -54,6 +54,7 @@ func TestRuntimeRetriesWriteAfterExplicitReconciliation(t *testing.T) {
 		Action:            OperationReconciliationRetry,
 		Actor:             "test-host",
 		Message:           "host confirmed no side effect",
+		Evidence:          json.RawMessage(`{"applied":false}`),
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
 	}
@@ -77,10 +78,27 @@ func TestExecutionTransitionRejectsConfirmedCompletionWithoutVerification(t *tes
 		ID: "transition-1", ExecutionID: "execution-1", AttemptID: "attempt-1",
 		RunID: "run-1", CallID: "call-1", Actor: "operator", Message: "completed",
 		From: OperationExecutionUnknown, To: OperationExecutionCompleted, VerificationRequired: true,
-		Result: OperationResult{Output: json.RawMessage(`{"applied":true}`)}, CreatedAt: time.Unix(10, 0),
+		Result:   OperationResult{Output: json.RawMessage(`{"applied":true}`)},
+		Evidence: json.RawMessage(`{"applied":true}`), CreatedAt: time.Unix(10, 0),
 	}
 	if err := transition.Validate(); !errors.Is(err, ErrInvalidExecutionTransition) {
 		t.Fatalf("Validate error=%v, want ErrInvalidExecutionTransition", err)
+	}
+}
+
+func TestExecutionTransitionRequiresEvidenceToResolveUnknownOutcome(t *testing.T) {
+	for _, target := range []OperationExecutionStatus{OperationExecutionRetryable, OperationExecutionCompleted} {
+		transition := OperationExecutionTransition{
+			ID: "transition-unknown-" + string(target), ExecutionID: "execution-1", AttemptID: "attempt-1",
+			RunID: "run-1", CallID: "call-1", Actor: "operator", Message: "resolved",
+			From: OperationExecutionUnknown, To: target, CreatedAt: time.Unix(10, 0),
+		}
+		if target == OperationExecutionCompleted {
+			transition.Result = OperationResult{Output: json.RawMessage(`{"applied":true}`)}
+		}
+		if err := transition.Validate(); !errors.Is(err, ErrInvalidExecutionTransition) {
+			t.Fatalf("target=%q Validate error=%v, want ErrInvalidExecutionTransition", target, err)
+		}
 	}
 }
 
@@ -136,6 +154,7 @@ func TestRuntimeReplaysHostReconciledCompletedWrite(t *testing.T) {
 		Verification:      &VerificationResult{Confirmed: true, Message: "host verified", Evidence: json.RawMessage(`{"version":2}`)},
 		Actor:             "test-host",
 		Message:           "host observed version 2",
+		Evidence:          json.RawMessage(`{"version":2,"attempt_committed":true}`),
 	}); err != nil {
 		t.Fatalf("ReconcileOperation: %v", err)
 	}

@@ -1,6 +1,9 @@
 package agentruntime
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 var (
 	ErrInvalidModelOutput         = errors.New("agent: invalid model output")
@@ -34,8 +37,17 @@ var (
 	ErrContextLimitExceeded       = errors.New("agent: context limit exceeded")
 	ErrContextCompactionFailed    = errors.New("agent: context compaction failed")
 	ErrImageAttachmentUnavailable = errors.New("agent: image attachment unavailable")
-	ErrRunInterrupted             = errors.New("agent: run interrupted")
-	ErrRunCancelled               = errors.New("agent: run cancelled")
+	ErrProviderRateLimited        = errors.New("agent: provider rate limited")
+	ErrProviderQuotaExceeded      = errors.New("agent: provider quota exceeded")
+	ErrProviderAuthentication     = errors.New("agent: provider authentication failed")
+	ErrProviderUnavailable        = errors.New("agent: provider temporarily unavailable")
+	ErrProviderRequestRejected    = errors.New("agent: provider request rejected")
+	// ErrInsufficientCredits is retained as a compatibility alias. Runtime does
+	// not own billing semantics; use ErrProviderQuotaExceeded instead.
+	// Deprecated: use ErrProviderQuotaExceeded.
+	ErrInsufficientCredits = ErrProviderQuotaExceeded
+	ErrRunInterrupted      = errors.New("agent: run interrupted")
+	ErrRunCancelled        = errors.New("agent: run cancelled")
 )
 
 // MarkOperationNotApplied lets a write executor prove that it failed before
@@ -112,9 +124,23 @@ func errorCode(err error) string {
 		return "context_compaction_failed"
 	case errors.Is(err, ErrImageAttachmentUnavailable):
 		return "image_attachment_unavailable"
+	case errors.Is(err, ErrProviderRateLimited):
+		return "provider_rate_limited"
+	case errors.Is(err, ErrProviderQuotaExceeded):
+		return "provider_quota_exceeded"
+	case errors.Is(err, ErrProviderAuthentication):
+		return "provider_authentication"
+	case errors.Is(err, ErrProviderUnavailable):
+		return "provider_unavailable"
+	case errors.Is(err, ErrProviderRequestRejected):
+		return "provider_request_rejected"
 	case errors.Is(err, ErrRunInterrupted):
 		return "run_interrupted"
 	case errors.Is(err, ErrRunCancelled):
+		return "run_cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "run_interrupted"
+	case errors.Is(err, context.Canceled):
 		return "run_cancelled"
 	default:
 		return "internal_error"

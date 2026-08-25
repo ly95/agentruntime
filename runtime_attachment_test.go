@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -56,36 +55,6 @@ type multiTurnChunkModel struct {
 
 type mutatingRequestModel struct {
 	turn int
-}
-
-type concurrentModel struct {
-	mu      sync.Mutex
-	calls   int
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (m *concurrentModel) Complete(_ context.Context, req ModelRequest) (*ModelResponse, error) {
-	m.mu.Lock()
-	m.calls++
-	m.mu.Unlock()
-	m.once.Do(func() { close(m.started) })
-	<-m.release
-	text := "done"
-	for i := len(req.Input) - 1; i >= 0; i-- {
-		if req.Input[i].Type == ModelInputUserMessage {
-			text = req.Input[i].Text
-			break
-		}
-	}
-	return messageResponse("resp-"+text, text), nil
-}
-
-func (m *concurrentModel) callCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.calls
 }
 
 func (m *multiTurnChunkModel) Complete(_ context.Context, req ModelRequest) (*ModelResponse, error) {
@@ -187,6 +156,69 @@ func TestRuntimeCarriesAttachmentsIntoModelTranscript(t *testing.T) {
 	if bytes.Contains(encoded, []byte("https://cdn.example.com/image.png")) || !bytes.Contains(encoded, []byte(`"storage_key":"temp/agent/user/image.png"`)) {
 		t.Fatalf("persisted transcript=%s", encoded)
 	}
+}
+
+func TestRuntimeAttachmentResolverDefaultAndPerRunOverride(t *testing.T) {
+	attachment := ModelInputAttachment{
+		Kind: ModelInputAttachmentImage,
+		ID:   "attachment-default", Filename: "image.png", MIMEType: "image/png",
+		StorageKey: "images/default.png", ExpiresAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+		URL: "https://cdn.example.com/original.png",
+	}
+	t.Run("runtime default", func(t *testing.T) {
+		model := &scriptedModel{responses: []*ModelResponse{messageResponse("resp-default-resolver", "done")}}
+		calls := 0
+		resolver := ImageAttachmentResolverFunc(func(_ context.Context, value ModelInputAttachment) (ModelInputAttachment, error) {
+			calls++
+			value.URL = "https://cdn.example.com/default.png"
+			return value, nil
+		})
+		runtime, err := NewRuntime(RuntimeConfig{
+			Model: model, RunStore: &recordingStore{}, ImageAttachmentResolver: resolver,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtime.Run(t.Context(), Input{
+			User: "inspect", SessionID: "session-default-resolver", Attachments: []ModelInputAttachment{attachment},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 || model.requests[0].Input[0].Attachments[0].URL != "https://cdn.example.com/default.png" {
+			t.Fatalf("resolver calls=%d request=%+v", calls, model.requests[0])
+		}
+	})
+
+	t.Run("per-run override", func(t *testing.T) {
+		model := &scriptedModel{responses: []*ModelResponse{messageResponse("resp-override-resolver", "done")}}
+		defaultCalls := 0
+		defaultResolver := ImageAttachmentResolverFunc(func(context.Context, ModelInputAttachment) (ModelInputAttachment, error) {
+			defaultCalls++
+			return ModelInputAttachment{}, errors.New("runtime default must be overridden")
+		})
+		overrideCalls := 0
+		override := ImageAttachmentResolverFunc(func(_ context.Context, value ModelInputAttachment) (ModelInputAttachment, error) {
+			overrideCalls++
+			value.URL = "https://cdn.example.com/override.png"
+			return value, nil
+		})
+		runtime, err := NewRuntime(RuntimeConfig{
+			Model: model, RunStore: &recordingStore{}, ImageAttachmentResolver: defaultResolver,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtime.Run(t.Context(), Input{
+			User: "inspect", SessionID: "session-override-resolver", Attachments: []ModelInputAttachment{attachment},
+			ImageAttachmentResolver: override,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if defaultCalls != 0 || overrideCalls != 1 ||
+			model.requests[0].Input[0].Attachments[0].URL != "https://cdn.example.com/override.png" {
+			t.Fatalf("default=%d override=%d request=%+v", defaultCalls, overrideCalls, model.requests[0])
+		}
+	})
 }
 
 func TestRuntimeRejectsSessionImageWithoutDurableResolutionContract(t *testing.T) {

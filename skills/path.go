@@ -22,7 +22,7 @@ func configuredDirectory(raw, kind string) (configured string, root *descriptorR
 		return "", nil, fmt.Errorf("%w: %s directory must be absolute", ErrInvalidSource, kind)
 	}
 	if hasParentComponent(raw) {
-		return "", nil, fmt.Errorf("%w: %s directory must not contain ..", ErrInvalidSource, kind)
+		return "", nil, fmt.Errorf("%w: %s directory must not contain .. parent components", ErrInvalidSource, kind)
 	}
 	configured = filepath.Clean(raw)
 	if configured != raw {

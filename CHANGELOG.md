@@ -6,7 +6,35 @@ include explicit compatibility guidance.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- A concurrency-safe process-local `InMemoryStore` and exported `storetest`
+  conformance suites for `RunStore` and `ExecutionStore`.
+- Public result artifacts and approval summaries, outcome and provider-error
+  classification, strict argument decoding, trusted input builders,
+  reconciliation evidence helpers, context defaults, and an error-returning ID
+  factory.
+- Safe event dispatch, metrics mapping, OpenTelemetry integration, lease and
+  reconciliation events, and provider token usage fields.
+- A bounded HTTP GitHub Skill fetcher, immutable Skill resources, and an
+  offline approval, retry, and reconciliation example.
+
+### Changed
+
+- Failed, interrupted, and cancelled runs atomically commit their error audit
+  item or explicitly record `audit_missing`.
+- OpenAI semantic validation is split by protocol domain and protected by a
+  checked-in golden stream corpus.
+
+### Deprecated
+
+- `RuntimeConfig.NewID`; use `IDFactory` so generation failures are explicit.
+- `ErrInsufficientCredits`; use `ErrProviderQuotaExceeded`.
+
+### Security
+
+- Added approval UI and log guidance, redaction helpers, strict provider
+  authority validation, and immutable resource access rules.
 
 ## [0.1.0] - 2026-08-25
 

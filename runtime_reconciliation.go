@@ -413,6 +413,25 @@ func equalOptionalOperationResult(left, right OperationResult) bool {
 // Complete may settle that exact started attempt only with durable evidence
 // proving the executor committed and with the full validated completion payload.
 func (r *Runtime) ReconcileOperation(ctx context.Context, request ReconcileOperationRequest) error {
+	event := Event{
+		Type: EventReconciliationStarted, ExecutionID: strings.TrimSpace(request.ExecutionID),
+		AttemptID: strings.TrimSpace(request.ExpectedAttemptID), Reconciliation: string(request.Action),
+	}
+	r.emit(event)
+	err := r.reconcileOperation(ctx, request)
+	if err != nil {
+		event.Type = EventReconciliationFailed
+		event.ErrorCode = errorCode(err)
+		event.Error = err.Error()
+		r.emit(event)
+		return err
+	}
+	event.Type = EventReconciliationCompleted
+	r.emit(event)
+	return nil
+}
+
+func (r *Runtime) reconcileOperation(ctx context.Context, request ReconcileOperationRequest) error {
 	if r.executions == nil {
 		return ErrExecutionStoreRequired
 	}
@@ -502,10 +521,13 @@ func (r *Runtime) ReconcileOperation(ctx context.Context, request ReconcileOpera
 		if execution.Status == OperationExecutionExecuted {
 			return fmt.Errorf("%w: executed operation %s cannot be retried; complete its verification instead", ErrInvalidReconciliation, execution.ID)
 		}
+		if execution.Status == OperationExecutionUnknown && len(request.Evidence) == 0 {
+			return fmt.Errorf("%w: retrying an unknown outcome requires evidence that the side effect was not applied", ErrInvalidReconciliation)
+		}
 		transition.To = OperationExecutionRetryable
 	case OperationReconciliationComplete:
-		if execution.Status == OperationExecutionStarted && len(request.Evidence) == 0 {
-			return fmt.Errorf("%w: started completion requires evidence that the exact attempt committed", ErrInvalidReconciliation)
+		if (execution.Status == OperationExecutionStarted || execution.Status == OperationExecutionUnknown) && len(request.Evidence) == 0 {
+			return fmt.Errorf("%w: unresolved completion requires evidence that the exact attempt committed", ErrInvalidReconciliation)
 		}
 		if len(request.Result.Output) == 0 {
 			return fmt.Errorf("%w: completed result output must be valid JSON", ErrInvalidReconciliation)

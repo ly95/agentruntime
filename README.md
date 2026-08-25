@@ -73,8 +73,10 @@ transition acknowledgements, and reconciliation.
 | `ResultVerifier` | Independently confirms the result of confirmation-required operations. |
 | `RunStore` | Persists sessions and serializes stateful runs with renewable, generation-fenced leases. |
 | `ExecutionStore` | Persists sealed write plans, idempotent execution records, and append-only transitions. |
+| `InMemoryStore` | Provides a concurrency-safe reference implementation for examples and protocol tests; production hosts still need durable transactional storage. |
 | `OperationReconciler` | Settles uncertain persisted writes without starting a model run. |
-| `ContextWindowConfig` / `EventSink` | Controls transcript compaction and observes structured runtime events. |
+| `ContextWindowConfig` / `EventDispatcher` | Controls transcript compaction and fans structured runtime events out through panic-safe adapters. |
+| `RunOutcome` / `SanitizedEvent` | Maps runtime results and events into stable host-facing status, retry, reconciliation, and safe JSON contracts. |
 | `skills.SkillSet` | Holds immutable, content-addressed Skill snapshots loaded from explicit host-selected sources. |
 
 ## Install
@@ -83,7 +85,7 @@ transition acknowledgements, and reconciliation.
 go get github.com/ly95/agentruntime@latest
 ```
 
-The module requires Go 1.26 or newer.
+The module requires Go 1.25 or newer.
 
 ## Quick start
 
@@ -159,9 +161,10 @@ filesystem resources after snapshotting. A host that calls a built-in source's
 public `Resolve` method directly must call `Close` on every returned
 `Artifact`.
 
-GitHub access is also host-owned: an injected `GitHubFetcher` resolves the
-configured ref to a commit SHA and returns copied `GitHubFile` records rooted at
-the requested Skill directory. The source rejects non-regular entry modes,
+GitHub access is also host-owned. `HTTPGitHubFetcher` is the bounded, read-only
+REST implementation; a host may instead inject its own `GitHubFetcher`. Both
+resolve the configured ref to a commit SHA and return copied `GitHubFile`
+records rooted at the requested Skill directory. The source rejects non-regular entry modes,
 validates path collisions and limits, and deep-copies all bytes before parsing;
 an arbitrary host filesystem is never retained as a confinement boundary.
 `GitHubFile.Mode` uses Go's `io/fs.FileMode` permission bits, not raw Git tree
@@ -181,8 +184,8 @@ skillSet, err := skills.LoadSet(ctx,
 			"/opt/agent-skills/release-notes",
 		},
 	}),
-	// githubFetcher is implemented and credentialed by the host. It is called
-	// once; the runtime does not add retries or persist its credentials.
+	// githubFetcher may be created with skills.NewHTTPGitHubFetcher. It never
+	// retries or sleeps; the host owns credentials and backoff policy.
 	skills.NewGitHubSource(skills.GitHubSourceConfig{
 		ID:         "github",
 		Repository: "owner/repository",
@@ -201,9 +204,13 @@ runtime, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{
 })
 ```
 
-Supporting files such as `references/`, `assets/`, and `meta.yaml` are preserved
-in the snapshot and covered by its digest, but the runtime injects only
-`SKILL.md`. It never executes `scripts/` or treats Skill files as tools.
+Supporting files such as `references/`, `assets/`, `meta.yaml`, and
+`agents/openai.yaml` are preserved in the snapshot and covered by its digest,
+and can be read as defensive copies through `Skill.ReadFile` or
+`SkillSet.ReadFile`. Only `SKILL.md` is injected into model instructions. The
+runtime never executes `scripts/`, loads hooks,
+starts Plugin MCP servers, interprets `.app.json`, or implements the rest of the
+Codex Plugin runtime.
 
 ## Operation requirements
 
@@ -216,7 +223,7 @@ The runtime validates required dependencies when it is constructed:
 | Any write operation | `ExecutionStore` in addition to policy and executor |
 | `ConfirmationRequired` operation | `ResultVerifier`; approval flows also use `Approver` and `ApprovalResumer` |
 | Stateful session | `RunStore` |
-| Custom `NewID` or explicit `Input.RunID` | `RunStore` as durable identity authority |
+| Custom `IDFactory` (or deprecated `NewID`) or explicit `Input.RunID` | `RunStore` as durable identity authority |
 
 Run identity, approval authority, and operation contracts are versioned and
 bound to durable state; the authoritative rules live in the corresponding
@@ -228,7 +235,9 @@ interface and configuration documentation (`store.go`, `operation_registry.go`,
   `RunStore` adopts the split `CreateRunV3`/`ResumeRunV3` methods and a
   synchronous, exactly-once, pre-commit acceptance callback; only an exact
   `ErrRunNotFound` selects the explicit-ID create fallback. A runtime without a
-  `RunStore` uses the built-in random factory and rejects custom `NewID`.
+  `RunStore` uses the built-in random factory and rejects custom `IDFactory`
+  and deprecated `NewID`. An `IDFactory` returns `(string, error)`, so entropy
+  failures remain ordinary runtime errors rather than panics.
 - **Reconciliation evidence**: a started attempt may only be abandoned with
   durable JSON evidence proving the executor never began, or completed with
   evidence proving it committed; the store fences that exact attempt atomically.
@@ -265,10 +274,23 @@ Runnable examples live in [`examples`](examples/README.md):
 | [`basic`](examples/basic/main.go) | A stateless agent without tools |
 | [`operations`](examples/operations/main.go) | A read-only host operation offered to the model as a function tool |
 | [`skill`](examples/skill/main.go) | An explicitly loaded local `SKILL.md` mounted beside a host-owned operation |
+| [`approval`](examples/approval/main.go) | A fully offline approval, resume, safe retry, and reconciliation workflow using the reference store |
 
-The examples intentionally keep their side effects read-only. Production write
-operations require the durable execution, approval, and verification boundaries
-described above.
+The approval example performs only simulated writes. Production write operations
+require the durable execution, approval, and verification boundaries described
+above.
+
+## Integration guides
+
+- [Host integration and approval resume](docs/host-integration-guide.md)
+- [Store adapter contract and conformance suites](docs/store-adapter-guide.md)
+- [Operation JSON Schema and argument decoding](docs/operation-schema-guide.md)
+- [Write and terminal-operation execution](docs/write-terminal-executor-guide.md)
+- [Context-window defaults and tuning](docs/context-window.md)
+- [Outcome and provider-error mapping](docs/error-outcome-guide.md)
+- [Safe events, metrics, tracing, and UI projection](docs/observability.md)
+- [Approval UI and log security](docs/approval-ui-security.md)
+- [Provider compatibility and MCP session benchmark](docs/provider-compatibility.md)
 
 ## Compatibility and guarantees
 
@@ -290,6 +312,8 @@ described above.
 ```bash
 go test ./...
 go vet ./...
+go test -race ./...
+GOTOOLCHAIN=go1.26.0 go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report
@@ -306,7 +330,6 @@ public API baseline are gated in CI before a tag is published.
 - [Support policy](SUPPORT.md)
 - [Roadmap and known limits](ROADMAP.md)
 - [v0.1.0 release notes](docs/releases/v0.1.0.md)
-
 ## License
 
 `agentruntime` is available under the [MIT License](LICENSE).

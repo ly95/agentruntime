@@ -350,7 +350,7 @@ func (filesystem nilInfoFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if name != "." {
 		return nil, fs.ErrNotExist
 	}
-	return []fs.DirEntry{nilInfoEntry{typed: filesystem.typed}}, nil
+	return []fs.DirEntry{nilInfoEntry(filesystem)}, nil
 }
 
 func (filesystem nilContentOpenFS) Open(name string) (fs.File, error) {

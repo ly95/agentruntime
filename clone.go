@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -791,10 +792,83 @@ func cloneModelOutputItems(items []ModelOutputItem) []ModelOutputItem {
 	return out
 }
 
-func randomID() string {
-	var value [16]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		panic(fmt.Errorf("agent runtime: generate random ID: %w", err))
+func cloneStoredItemRecord(item ItemRecord) ItemRecord {
+	item.Data = append(json.RawMessage(nil), item.Data...)
+	return item
+}
+
+func cloneStoredSessionState(session SessionState) SessionState {
+	session.Transcript = cloneModelInputItems(session.Transcript)
+	session.Checkpoint = cloneContextCheckpoint(session.Checkpoint)
+	session.SeenCallIDs = cloneStringsPreserveNil(session.SeenCallIDs)
+	return session
+}
+
+func cloneStoredOperationPlanBatch(batch OperationPlanBatch) OperationPlanBatch {
+	batch.Steps = append([]OperationPlanStep(nil), batch.Steps...)
+	for index := range batch.Steps {
+		batch.Steps[index].Arguments = append(json.RawMessage(nil), batch.Steps[index].Arguments...)
 	}
-	return hex.EncodeToString(value[:])
+	return batch
+}
+
+func cloneStoredOperationExecution(execution OperationExecutionRecord) OperationExecutionRecord {
+	execution.Arguments = append(json.RawMessage(nil), execution.Arguments...)
+	execution.Result = cloneOperationResult(execution.Result)
+	if execution.Verification != nil {
+		verification := cloneVerificationResult(*execution.Verification)
+		execution.Verification = &verification
+	}
+	return execution
+}
+
+func cloneStoredOperationTransition(transition OperationExecutionTransition) OperationExecutionTransition {
+	transition.Result = cloneOperationResult(transition.Result)
+	if transition.Verification != nil {
+		verification := cloneVerificationResult(*transition.Verification)
+		transition.Verification = &verification
+	}
+	transition.Evidence = append(json.RawMessage(nil), transition.Evidence...)
+	return transition
+}
+
+func cloneStoredPendingApproval(pending PendingApprovalCommit) (PendingApprovalCommit, error) {
+	request := pending.Request
+	input, err := cloneOperationInput(request.Operation.Input)
+	if err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	request.Operation.Input = input
+	request.Operation.Operation = cloneOperationSummaries([]OperationSummary{request.Operation.Operation})[0]
+	request.Operation.Call.Input = append(json.RawMessage(nil), request.Operation.Call.Input...)
+	arguments, err := json.Marshal(request.Operation.Arguments)
+	if err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	request.Operation.Arguments, err = decodeExactJSON(arguments)
+	if err != nil {
+		return PendingApprovalCommit{}, err
+	}
+	request.ModelOutput = cloneModelOutputItems(request.ModelOutput)
+	request.Preview = append(json.RawMessage(nil), request.Preview...)
+	request.Checkpoint = cloneApprovalCheckpoint(request.Checkpoint, true)
+	return PendingApprovalCommit{
+		AuthorityVersion: pending.AuthorityVersion,
+		Request:          request,
+		Decision:         pending.Decision,
+		Audit:            cloneStoredItemRecord(pending.Audit),
+		Digest:           pending.Digest,
+	}, nil
+}
+
+func randomID() (string, error) {
+	return randomIDFrom(rand.Reader)
+}
+
+func randomIDFrom(reader io.Reader) (string, error) {
+	var value [16]byte
+	if _, err := io.ReadFull(reader, value[:]); err != nil {
+		return "", fmt.Errorf("crypto/rand: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
 }

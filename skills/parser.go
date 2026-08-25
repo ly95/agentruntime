@@ -209,18 +209,6 @@ func walkArtifactEntries(filesystem fs.FS, maximumEntries int, visit func(string
 	return walk(".", rootEntry)
 }
 
-func readArtifactDirectory(filesystem fs.FS, directory string, remaining int) ([]artifactEntry, error) {
-	info, err := statFSPath(filesystem, directory)
-	if err != nil {
-		return nil, err
-	}
-	snapshot, err := snapshotArtifactFileInfo(info, fmt.Sprintf("directory %q", directory))
-	if err != nil {
-		return nil, err
-	}
-	return readVerifiedArtifactDirectory(filesystem, directory, remaining, artifactEntry{name: snapshot.name, info: snapshot})
-}
-
 func readVerifiedArtifactDirectory(filesystem fs.FS, directory string, remaining int, expected artifactEntry) ([]artifactEntry, error) {
 	opened, err := filesystem.Open(directory)
 	if err != nil {
@@ -398,22 +386,10 @@ func validateArtifactPath(filePath string) error {
 	}
 	for _, component := range strings.Split(filePath, "/") {
 		if component == ".." {
-			return fmt.Errorf("%w: file path %q contains ..", ErrInvalidArtifact, filePath)
+			return fmt.Errorf("%w: file path %q contains a parent component", ErrInvalidArtifact, filePath)
 		}
 	}
 	return nil
-}
-
-func readFSFile(filesystem fs.FS, filePath string, maximum int64) ([]byte, error) {
-	info, err := statFSPath(filesystem, filePath)
-	if err != nil {
-		return nil, err
-	}
-	snapshot, err := snapshotArtifactFileInfo(info, fmt.Sprintf("file %q", filePath))
-	if err != nil {
-		return nil, err
-	}
-	return readVerifiedArtifactFile(filesystem, filePath, maximum, artifactEntry{name: snapshot.name, info: snapshot})
 }
 
 func readVerifiedArtifactFile(filesystem fs.FS, filePath string, maximum int64, expected artifactEntry) ([]byte, error) {

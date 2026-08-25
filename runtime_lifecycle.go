@@ -180,6 +180,16 @@ func (snapshot runStateSnapshot) restore(state *agentState, _ *RunRecord) {
 }
 
 func normalizeRuntimeInput(input Input) (Input, error) {
+	return normalizeRuntimeInputWithResolver(input, nil)
+}
+
+func normalizeRuntimeInputWithResolver(input Input, defaultResolver ImageAttachmentResolver) (Input, error) {
+	if input.ImageAttachmentResolver != nil && isNilDependency(input.ImageAttachmentResolver) {
+		return Input{}, errors.New("agent: input image attachment resolver is nil")
+	}
+	if input.ImageAttachmentResolver == nil {
+		input.ImageAttachmentResolver = defaultResolver
+	}
 	boundary := input
 	boundary.ImageAttachmentResolver = nil
 	if err := validateUTF8Boundary("runtime input", boundary); err != nil {
@@ -289,7 +299,7 @@ func (r *Runtime) beginRuntimeRun(
 	}
 	handle := RunHandle{RunID: run.ID, SessionID: run.SessionID}
 	if r.runStore == nil {
-		state, err := r.stateFromSessionAt(run.ID, input.SessionID, handle.LeaseID, handle, nil, now)
+		state, err := r.stateFromSessionAt(run.ID, input.SessionID, handle.LeaseID, handle, nil, now, now)
 		return run, state, err
 	}
 	startRoute := &runStartRoute{}
@@ -307,6 +317,9 @@ func (r *Runtime) beginRuntimeRun(
 		}
 	}
 	createRequest := CreateRunRequest{Run: storeRun, LeaseID: leaseID, LeaseTTL: r.sessionLeaseTTL}
+	if err := createRequest.Validate(); err != nil {
+		return RunRecord{}, nil, err
+	}
 	if err := validateUTF8Boundary("create run request", createRequest); err != nil {
 		return RunRecord{}, nil, err
 	}
@@ -320,7 +333,7 @@ func (r *Runtime) beginRuntimeRun(
 				return createdRunStart{}, err
 			}
 			state, err := r.stateFromSessionAt(
-				run.ID, input.SessionID, leaseID, start.Handle, start.Session, acceptanceTime(),
+				run.ID, input.SessionID, leaseID, start.Handle, start.Session, now, acceptanceTime(),
 			)
 			if err != nil {
 				return createdRunStart{}, err
@@ -362,6 +375,9 @@ func (r *Runtime) beginRuntimeRun(
 	resumeRequest := ResumeRunRequest{
 		Run: storeRun, LeaseID: leaseID, LeaseTTL: r.sessionLeaseTTL, InputDigest: inputDigest,
 	}
+	if err := resumeRequest.Validate(); err != nil {
+		return RunRecord{}, nil, err
+	}
 	if err := validateUTF8Boundary("resume run request", resumeRequest); err != nil {
 		return RunRecord{}, nil, err
 	}
@@ -379,7 +395,7 @@ func (r *Runtime) beginRuntimeRun(
 				return resumedRunStart{}, err
 			}
 			state, err := r.stateFromSessionAt(
-				run.ID, input.SessionID, leaseID, resumed.Handle, resumed.Session, acceptanceTime(),
+				run.ID, input.SessionID, leaseID, resumed.Handle, resumed.Session, now, acceptanceTime(),
 			)
 			if err != nil {
 				return resumedRunStart{}, err
@@ -574,8 +590,19 @@ func (active *activeRunLease) wait() (*Result, error) {
 	return result, nil
 }
 
+// ResumeApproval resumes or polls one durable waiting approval through the same
+// fenced Run path. Input must repeat the original RunID, SessionID, user input,
+// attachments, metadata, and trusted idempotency fields; ApprovalResumer remains
+// the host authority for the current decision.
+func (r *Runtime) ResumeApproval(ctx context.Context, input Input) (*Result, error) {
+	if strings.TrimSpace(input.RunID) == "" {
+		return nil, fmt.Errorf("%w: approval resume requires run id", ErrApprovalRequired)
+	}
+	return r.Run(ctx, input)
+}
+
 func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
-	input, err := normalizeRuntimeInput(input)
+	input, err := normalizeRuntimeInputWithResolver(input, r.imageAttachmentResolver)
 	if err != nil {
 		return nil, err
 	}
@@ -649,7 +676,8 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 }
 
 func (r *Runtime) stateFromSession(runID, sessionID string, handle RunHandle, session *SessionState) (*agentState, error) {
-	return r.stateFromSessionAt(runID, sessionID, handle.LeaseID, handle, session, r.now())
+	now := r.now()
+	return r.stateFromSessionAt(runID, sessionID, handle.LeaseID, handle, session, now, now)
 }
 
 func (r *Runtime) stateFromSessionAt(
@@ -657,19 +685,27 @@ func (r *Runtime) stateFromSessionAt(
 	expectedLeaseID string,
 	handle RunHandle,
 	session *SessionState,
-	now time.Time,
+	createdAt time.Time,
+	acceptedAt time.Time,
 ) (*agentState, error) {
+	lease := newLeaseGuard(r.runStore, handle, r.sessionLeaseTTL, r.leaseRenewalInterval, r.cleanupTimeout)
+	lease.onRenew = func(renewed RunHandle) {
+		r.emit(Event{
+			Type: EventSessionLeaseRenewed, RunID: runID, SessionID: sessionID,
+			LeaseGeneration: renewed.LeaseGeneration, SessionRevision: renewed.SessionRevision,
+		})
+	}
 	state := &agentState{
 		sessionID:              sessionID,
-		lease:                  newLeaseGuard(r.runStore, handle, r.sessionLeaseTTL, r.leaseRenewalInterval, r.cleanupTimeout),
+		lease:                  lease,
 		seenCallIDs:            make(map[string]struct{}),
 		seenResponseIDs:        make(map[string]struct{}),
 		seenProviderItemIDs:    make(map[string]struct{}),
-		createdAt:              now,
+		createdAt:              createdAt,
 		instructions:           r.baseInstructions,
 		persistentInstructions: r.baseInstructions,
 	}
-	if err := validateRunHandle(runID, sessionID, expectedLeaseID, handle, session, now); err != nil {
+	if err := validateRunHandle(runID, sessionID, expectedLeaseID, handle, session, acceptedAt); err != nil {
 		return state, err
 	}
 	if err := validateUTF8Boundary("persisted session", session); err != nil {
@@ -715,7 +751,7 @@ func (r *Runtime) stateFromSessionAt(
 	}
 	state.createdAt = session.CreatedAt
 	if state.createdAt.IsZero() {
-		state.createdAt = now
+		state.createdAt = createdAt
 	}
 	state.sessionReady = true
 	return state, nil

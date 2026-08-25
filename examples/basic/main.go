@@ -25,21 +25,28 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	agent, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{Model: model})
-	if err != nil {
-		return fmt.Errorf("create runtime: %w", err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	result, err := agent.Run(ctx, agentruntime.Input{
-		User: commandPrompt("Explain what an agent control loop does in one paragraph."),
-	})
+	result, err := runWithModel(ctx, model, commandPrompt("Explain what an agent control loop does in one paragraph."))
 	if err != nil {
-		return fmt.Errorf("run agent: %w", err)
+		return err
 	}
 	fmt.Println(result.Output)
 	return nil
+}
+
+func runWithModel(ctx context.Context, model agentruntime.Model, prompt string) (*agentruntime.Result, error) {
+	agent, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{Model: model})
+	if err != nil {
+		return nil, fmt.Errorf("create runtime: %w", err)
+	}
+	result, err := agent.Run(ctx, agentruntime.Input{
+		User: prompt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("run agent: %w", err)
+	}
+	return result, nil
 }
 
 func newOpenAIModel() (*agentruntime.OpenAIModel, error) {

@@ -239,6 +239,20 @@ func (s *recordingStore) beginRunV3(
 		return ErrRunNotFound
 	}
 	if resume {
+		inputMatches, inputErr := samePersistentRunInput(s.runs[runIndex].Input, request.Run.Input)
+		if inputErr != nil {
+			return inputErr
+		}
+		if !inputMatches {
+			return fmt.Errorf("%w: waiting run %s input changed", ErrOperationPlanChanged, request.Run.ID)
+		}
+		if request.Run.UpdatedAt.Before(s.runs[runIndex].UpdatedAt) {
+			return fmt.Errorf("%w: waiting run %s timestamp moved backward", ErrRunStoreProtocol, request.Run.ID)
+		}
+		request.Run.CreatedAt = s.runs[runIndex].CreatedAt
+		request.Run.Input = s.runs[runIndex].Input
+	}
+	if resume {
 		if pendingApprovalDigest == "" {
 			return fmt.Errorf("%w: waiting run %s has no durable approval authority", ErrOperationPlanChanged, request.Run.ID)
 		}
@@ -424,8 +438,12 @@ func (s *recordingStore) abandonExpiredRunLocked(runID string, now time.Time) {
 			continue
 		}
 		s.runs[i].Status = RunStatusFailed
+		s.runs[i].ErrorCode = "session_lease_lost"
 		s.runs[i].Error = "agent: session lease expired before run completion"
+		s.runs[i].PendingApprovalDigest = ""
+		s.runs[i].FailureAuditStatus = FailureAuditMissing
 		s.runs[i].UpdatedAt = now
+		delete(s.pendingApprovals, runID)
 		s.failed = append(s.failed, s.runs[i])
 		return
 	}
@@ -457,6 +475,18 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 	if s.runs[storedRunIndex].OperationSetID != run.OperationSetID {
 		return fmt.Errorf("%w: run %s operation set", ErrOperationPlanChanged, run.ID)
 	}
+	inputMatches, inputErr := samePersistentRunInput(s.runs[storedRunIndex].Input, run.Input)
+	if inputErr != nil {
+		return inputErr
+	}
+	if !inputMatches {
+		return fmt.Errorf("%w: run %s input changed", ErrRunStoreProtocol, run.ID)
+	}
+	if run.UpdatedAt.Before(s.runs[storedRunIndex].UpdatedAt) {
+		return fmt.Errorf("%w: run %s timestamp moved backward", ErrRunStoreProtocol, run.ID)
+	}
+	run.CreatedAt = s.runs[storedRunIndex].CreatedAt
+	run.Input = s.runs[storedRunIndex].Input
 	if run.SessionID != "" {
 		existing, exists := s.sessions[run.SessionID]
 		if exists && existing.SkillSetID != run.SkillSetID {
@@ -530,6 +560,17 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 			return err
 		}
 	}
+	var failureItem *ItemRecord
+	if request.FailureItem != nil {
+		cloned := cloneStoredItemRecord(*request.FailureItem)
+		if err := validateStoredItem(cloned); err != nil {
+			return err
+		}
+		if err := s.requireAvailableItemIdentityLocked(cloned.ID); err != nil {
+			return err
+		}
+		failureItem = &cloned
+	}
 	if run.SessionID != "" {
 		active, ok := s.leases[run.SessionID]
 		if !ok || !sameTestLeaseOwner(active, request.Handle) || !active.LeaseDeadline.After(s.currentTime()) {
@@ -560,6 +601,9 @@ func (s *recordingStore) FinishRun(_ context.Context, request FinishRunRequest) 
 	}
 	if approvalAudit != nil {
 		s.items = append(s.items, *approvalAudit)
+	}
+	if failureItem != nil {
+		s.items = append(s.items, *failureItem)
 	}
 	if approvalCommit != nil {
 		if s.pendingApprovals == nil {

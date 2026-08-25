@@ -41,13 +41,15 @@ func NewOpenAIModel(client openai.Client, cfg OpenAIModelConfig) (*OpenAIModel, 
 		if !validOpenAIReasoningSummary(params.Summary) {
 			return nil, fmt.Errorf("agent: unsupported OpenAI reasoning summary %q", params.Summary)
 		}
-		if !validOpenAIReasoningGenerateSummary(params.GenerateSummary) {
-			return nil, fmt.Errorf("agent: unsupported deprecated OpenAI reasoning generate summary %q", params.GenerateSummary)
+		//lint:ignore SA1019 The SDK field remains accepted for pre-v1 compatibility and is validated explicitly.
+		generateSummary := params.GenerateSummary
+		if !validOpenAIReasoningGenerateSummary(generateSummary) {
+			return nil, fmt.Errorf("agent: unsupported deprecated OpenAI reasoning generate summary %q", generateSummary)
 		}
-		if params.Summary != "" && params.GenerateSummary != "" {
+		if params.Summary != "" && generateSummary != "" {
 			return nil, errors.New("agent: OpenAI reasoning summary and deprecated generate summary cannot both be set")
 		}
-		if params.Effort == shared.ReasoningEffortNone && (params.Summary != "" || params.GenerateSummary != "") {
+		if params.Effort == shared.ReasoningEffortNone && (params.Summary != "" || generateSummary != "") {
 			return nil, errors.New("agent: OpenAI reasoning summary must be omitted when effort is none")
 		}
 		reasoning = &params
@@ -76,7 +78,11 @@ func (m *OpenAIModel) Complete(ctx context.Context, req ModelRequest) (*ModelRes
 			return nil, err
 		}
 	}
-	return state.finish(stream.Err())
+	response, err := state.finish(stream.Err())
+	if err != nil {
+		return nil, classifyOpenAIError(err)
+	}
+	return response, nil
 }
 
 func (m *OpenAIModel) buildResponseParams(req ModelRequest) (responses.ResponseNewParams, error) {

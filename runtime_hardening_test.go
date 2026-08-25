@@ -297,7 +297,7 @@ func TestReconcileConfirmedWriteRequiresVerificationEvidence(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now }, newID: func() string { return "reconcile-transition" }}
+	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now }, newID: func() (string, error) { return "reconcile-transition", nil }}
 	err := runtime.ReconcileOperation(context.Background(), ReconcileOperationRequest{
 		ExecutionID: execution.ID, ExpectedAttemptID: execution.AttemptID,
 		Action: OperationReconciliationComplete,
@@ -2311,7 +2311,7 @@ func TestReconciliationFailRequiresCurrentOperationContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	missing := &Runtime{operations: NewOperationRegistry(), executions: store, now: func() time.Time { return now }, newID: func() string { return "missing" }}
+	missing := &Runtime{operations: NewOperationRegistry(), executions: store, now: func() time.Time { return now }, newID: func() (string, error) { return "missing", nil }}
 	if err := missing.ReconcileOperation(context.Background(), request); !errors.Is(err, ErrOperationNotFound) {
 		t.Fatalf("missing operation error=%v, want ErrOperationNotFound", err)
 	}
@@ -2321,7 +2321,7 @@ func TestReconciliationFailRequiresCurrentOperationContract(t *testing.T) {
 	if err := changedOps.Register(changed); err != nil {
 		t.Fatal(err)
 	}
-	changedRuntime := &Runtime{operations: changedOps, executions: store, now: func() time.Time { return now }, newID: func() string { return "changed" }}
+	changedRuntime := &Runtime{operations: changedOps, executions: store, now: func() time.Time { return now }, newID: func() (string, error) { return "changed", nil }}
 	if err := changedRuntime.ReconcileOperation(context.Background(), request); !errors.Is(err, ErrOperationPlanChanged) {
 		t.Fatalf("changed operation error=%v, want ErrOperationPlanChanged", err)
 	}
@@ -2336,7 +2336,7 @@ func TestReconciliationFailRequiresCurrentOperationContract(t *testing.T) {
 	if len(after) != len(before) || current.Status != OperationExecutionUnknown {
 		t.Fatalf("transitions=%d status=%q, want %d unchanged unknown", len(after), current.Status, len(before))
 	}
-	valid := &Runtime{operations: originals, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() string { return "valid" }}
+	valid := &Runtime{operations: originals, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() (string, error) { return "valid", nil }}
 	if err := valid.ReconcileOperation(context.Background(), request); err != nil {
 		t.Fatalf("valid fail reconciliation: %v", err)
 	}
@@ -3185,11 +3185,11 @@ func TestStaleReconciliationAcknowledgementCannotReportSuccess(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now }, newID: func() string { return "reconcile" }}
+	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now }, newID: func() (string, error) { return "reconcile", nil }}
 	err := runtime.ReconcileOperation(context.Background(), ReconcileOperationRequest{
 		ExecutionID: execution.ID, ExpectedAttemptID: execution.AttemptID,
 		Action: OperationReconciliationComplete, Result: OperationResult{Output: json.RawMessage(`{"applied":true}`)},
-		Actor: "operator", Message: "confirmed",
+		Actor: "operator", Message: "confirmed", Evidence: json.RawMessage(`{"applied":true}`),
 	})
 	if !errors.Is(err, ErrInvalidExecutionTransition) {
 		t.Fatalf("ReconcileOperation error=%v, want ErrInvalidExecutionTransition", err)
@@ -3637,7 +3637,7 @@ func TestRecoveryFailedAcknowledgementCannotRewriteDurableResult(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() string { return "recovery" }}
+	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() (string, error) { return "recovery", nil }}
 	err := runtime.ReconcileOperation(context.Background(), ReconcileOperationRequest{
 		ExecutionID: execution.ID, ExpectedAttemptID: execution.AttemptID,
 		Action: OperationReconciliationFail, Actor: "operator", Message: "cannot recover",
@@ -3701,7 +3701,7 @@ func TestReconciliationRejectsMalformedDurableArgumentsBeforeTransition(t *testi
 		t.Fatal(err)
 	}
 	store.corrupt = true
-	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() string { return "retry" }}
+	runtime := &Runtime{operations: ops, executions: store, now: func() time.Time { return now.Add(2 * time.Second) }, newID: func() (string, error) { return "retry", nil }}
 	err := runtime.ReconcileOperation(context.Background(), ReconcileOperationRequest{
 		ExecutionID: execution.ID, ExpectedAttemptID: execution.AttemptID,
 		Action: OperationReconciliationRetry, Actor: "operator", Message: "retry",

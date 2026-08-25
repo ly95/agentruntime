@@ -48,9 +48,19 @@ type RunRecord struct {
 	Artifacts             []ResultArtifact
 	ErrorCode             string
 	Error                 string
+	FailureAuditStatus    FailureAuditStatus
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 }
+
+// FailureAuditStatus records whether a terminal error audit item was committed
+// atomically with the failed/interrupted/cancelled RunRecord.
+type FailureAuditStatus string
+
+const (
+	FailureAuditCommitted FailureAuditStatus = "committed"
+	FailureAuditMissing   FailureAuditStatus = "audit_missing"
+)
 
 type ItemRecord struct {
 	ID             string
@@ -104,6 +114,16 @@ type CreateRunRequest struct {
 	LeaseTTL time.Duration
 }
 
+// Validate checks the context-free CreateRunV3 request contract. Store
+// implementations should call it before opening a transaction; Runtime calls
+// it before invoking the store as an additional fail-explicit boundary.
+func (request CreateRunRequest) Validate() error {
+	if err := validateRunStartRequest(request.Run, request.LeaseID, request.LeaseTTL); err != nil {
+		return fmt.Errorf("%w: create run: %v", ErrRunStoreProtocol, err)
+	}
+	return nil
+}
+
 type RunStart struct {
 	Handle  RunHandle
 	Session *SessionState
@@ -114,6 +134,61 @@ type ResumeRunRequest struct {
 	LeaseID     string
 	LeaseTTL    time.Duration
 	InputDigest string
+}
+
+// Validate checks the context-free ResumeRunV3 request contract.
+func (request ResumeRunRequest) Validate() error {
+	if err := validateRunStartRequest(request.Run, request.LeaseID, request.LeaseTTL); err != nil {
+		return fmt.Errorf("%w: resume run: %v", ErrRunStoreProtocol, err)
+	}
+	if strings.TrimSpace(request.InputDigest) == "" {
+		return fmt.Errorf("%w: resume run input digest is required", ErrRunStoreProtocol)
+	}
+	return nil
+}
+
+func validateRunStartRequest(run RunRecord, leaseID string, leaseTTL time.Duration) error {
+	if err := validateUTF8Boundary("run start request", struct {
+		Run     RunRecord
+		LeaseID string
+	}{Run: run, LeaseID: leaseID}); err != nil {
+		return err
+	}
+	if err := requireCanonicalIdentity(run.ID, "run id"); err != nil {
+		return err
+	}
+	if run.SessionID != "" {
+		if err := requireCanonicalIdentity(run.SessionID, "session id"); err != nil {
+			return err
+		}
+		if err := requireCanonicalIdentity(leaseID, "lease id"); err != nil {
+			return err
+		}
+	} else if leaseID != "" {
+		return fmt.Errorf("stateless run cannot carry a lease id")
+	}
+	if leaseTTL <= 0 {
+		return fmt.Errorf("lease TTL must be positive")
+	}
+	if run.Status != RunStatusRunning {
+		return fmt.Errorf("run status must be %q", RunStatusRunning)
+	}
+	if run.CreatedAt.IsZero() || run.UpdatedAt.IsZero() || run.UpdatedAt.Before(run.CreatedAt) {
+		return fmt.Errorf("run timestamps are invalid")
+	}
+	if run.Input.RunID != "" && run.Input.RunID != run.ID {
+		return fmt.Errorf("input run id does not match run")
+	}
+	if run.Input.SessionID != run.SessionID {
+		return fmt.Errorf("input session id does not match run")
+	}
+	if run.Input.ImageAttachmentResolver != nil || run.Input.TrustedContext != "" {
+		return fmt.Errorf("persistent run input contains transient trusted dependencies")
+	}
+	if run.PendingApprovalDigest != "" || run.Result != "" || len(run.Artifacts) != 0 || run.ErrorCode != "" || run.Error != "" {
+		return fmt.Errorf("running run contains terminal or approval state")
+	}
+	return nil
 }
 
 type ResumedRun struct {
@@ -140,6 +215,95 @@ type FinishRunRequest struct {
 	Run             RunRecord
 	Session         *SessionState
 	PendingApproval *PendingApprovalCommit
+	// FailureItem is appended atomically with a failed, interrupted, or
+	// cancelled run. Stores must not terminalize the run if this append fails.
+	FailureItem *ItemRecord
+}
+
+// Validate checks the context-free FinishRun request contract. Durable stores
+// remain responsible for comparing the request with current lease, session,
+// run, and approval authority inside one transaction.
+func (request FinishRunRequest) Validate() error {
+	if err := validateUTF8Boundary("finish run request", request); err != nil {
+		return fmt.Errorf("%w: finish run: %v", ErrRunStoreProtocol, err)
+	}
+	run := request.Run
+	if err := requireCanonicalIdentity(run.ID, "run id"); err != nil {
+		return fmt.Errorf("%w: finish run: %v", ErrRunStoreProtocol, err)
+	}
+	switch run.Status {
+	case RunStatusWaitingUser, RunStatusCompleted, RunStatusFailed, RunStatusInterrupted, RunStatusCancelled:
+	default:
+		return fmt.Errorf("%w: finish run has invalid status %q", ErrRunStoreProtocol, run.Status)
+	}
+	if request.Handle.RunID != run.ID || request.Handle.SessionID != run.SessionID {
+		return fmt.Errorf("%w: finish handle does not match run", ErrRunStoreProtocol)
+	}
+	if run.SessionID == "" {
+		if request.Handle.LeaseID != "" || request.Handle.LeaseGeneration != 0 ||
+			!request.Handle.LeaseDeadline.IsZero() || request.Handle.SessionRevision != 0 || request.Session != nil {
+			return fmt.Errorf("%w: stateless finish carries session authority", ErrRunStoreProtocol)
+		}
+	} else {
+		if err := requireCanonicalIdentity(request.Handle.LeaseID, "finish lease id"); err != nil {
+			return fmt.Errorf("%w: finish run: %v", ErrRunStoreProtocol, err)
+		}
+		if request.Handle.LeaseGeneration == 0 || request.Handle.LeaseDeadline.IsZero() {
+			return fmt.Errorf("%w: finish handle has invalid lease authority", ErrRunStoreProtocol)
+		}
+		if request.Session != nil {
+			session := request.Session
+			if session.ID != run.SessionID || session.LastRunID != run.ID {
+				return fmt.Errorf("%w: finish session does not identify the run", ErrRunStoreProtocol)
+			}
+			if request.Handle.SessionRevision == ^uint64(0) || session.Revision != request.Handle.SessionRevision+1 {
+				return fmt.Errorf("%w: finish session revision does not advance the handle", ErrRunStoreProtocol)
+			}
+			if session.CreatedAt.IsZero() || session.UpdatedAt.IsZero() || session.UpdatedAt.Before(session.CreatedAt) {
+				return fmt.Errorf("%w: finish session timestamps are invalid", ErrRunStoreProtocol)
+			}
+		}
+	}
+	if run.UpdatedAt.IsZero() || run.UpdatedAt.Before(run.CreatedAt) {
+		return fmt.Errorf("%w: finish run timestamps are invalid", ErrRunStoreProtocol)
+	}
+	if run.Input.ImageAttachmentResolver != nil || run.Input.TrustedContext != "" {
+		return fmt.Errorf("%w: finished run input contains transient trusted dependencies", ErrRunStoreProtocol)
+	}
+	if run.Status == RunStatusWaitingUser {
+		if strings.TrimSpace(run.PendingApprovalDigest) == "" {
+			return fmt.Errorf("%w: waiting run has no approval digest", ErrRunStoreProtocol)
+		}
+	} else if run.PendingApprovalDigest != "" || request.PendingApproval != nil {
+		return fmt.Errorf("%w: terminal run carries pending approval authority", ErrRunStoreProtocol)
+	}
+	switch run.Status {
+	case RunStatusFailed, RunStatusInterrupted, RunStatusCancelled:
+		if strings.TrimSpace(run.ErrorCode) == "" || strings.TrimSpace(run.Error) == "" || run.Result != "" {
+			return fmt.Errorf("%w: terminal error run has an invalid status payload", ErrRunStoreProtocol)
+		}
+		if request.FailureItem != nil {
+			if run.FailureAuditStatus != FailureAuditCommitted {
+				return fmt.Errorf("%w: terminal error item is not marked committed", ErrRunStoreProtocol)
+			}
+			if request.FailureItem.Type != ItemTypeError || request.FailureItem.RunID != run.ID || request.FailureItem.SessionID != run.SessionID {
+				return fmt.Errorf("%w: terminal error item does not match run", ErrRunStoreProtocol)
+			}
+			if err := validateStoredItem(*request.FailureItem); err != nil {
+				return fmt.Errorf("%w: terminal error item: %v", ErrRunStoreProtocol, err)
+			}
+		} else if run.FailureAuditStatus != FailureAuditMissing {
+			return fmt.Errorf("%w: terminal error run must record audit_missing", ErrRunStoreProtocol)
+		}
+	case RunStatusCompleted, RunStatusWaitingUser:
+		if run.ErrorCode != "" || run.Error != "" || (run.Status == RunStatusWaitingUser && run.Result != "") {
+			return fmt.Errorf("%w: successful or waiting run has an invalid status payload", ErrRunStoreProtocol)
+		}
+		if request.FailureItem != nil || run.FailureAuditStatus != "" {
+			return fmt.Errorf("%w: successful or waiting run carries failure audit state", ErrRunStoreProtocol)
+		}
+	}
+	return nil
 }
 
 // PendingApprovalCommit carries the approval request and its audit item into
@@ -198,10 +362,21 @@ type SessionLeaseFence struct {
 // RenewRunLease extends only a live matching generation. ValidateRunLease lets
 // Runtime reject a stale owner immediately after run-start return and before a
 // write side effect.
-// FinishRun atomically terminalizes or pauses the run, commits the next session
-// snapshot when supplied, and releases the lease. Lease renewal remains active
-// while FinishRun executes, so stores must validate the live owner fields and
-// deadline; the request handle's observed LeaseDeadline may lag a renewal.
+// FinishRun atomically terminalizes or pauses a currently running run, commits
+// the next session snapshot when supplied, and releases the lease. Duplicate or
+// stale finish requests must return ErrRunStoreProtocol without mutation. Lease
+// renewal remains active while FinishRun executes, so stores must validate the
+// live owner fields and deadline; the request handle's observed LeaseDeadline
+// may lag a renewal.
+// A stateless finish must not carry lease or session authority. A supplied
+// Session must identify the finishing run through ID and LastRunID, advance the
+// handle revision exactly once, retain a non-zero existing CreatedAt, and never
+// move UpdatedAt backward. Waiting and completed runs carry no error payload;
+// failed, interrupted, and cancelled runs carry a non-empty error code and
+// message and no successful Result.
+// Run.CreatedAt and persistent Run.Input are immutable after CreateRunV3.
+// ResumeRunV3 and FinishRun must retain them rather than replacing them with a
+// caller's current-run values, and neither may move Run.UpdatedAt backward.
 // When PendingApproval is supplied, FinishRun must also atomically persist that
 // complete approval record, its Digest, and its audit item. The approval
 // checkpoint's ExpectedSessionRevision must equal the session revision committed
@@ -267,6 +442,42 @@ type OperationPlanBatch struct {
 	CreatedAt        time.Time
 }
 
+// Validate checks one immutable write-plan batch before reservation.
+func (batch OperationPlanBatch) Validate() error {
+	if err := validateUTF8Boundary("operation plan batch", batch); err != nil {
+		return fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+	}
+	if err := requireCanonicalIdentity(batch.RequestID, "plan request id"); err != nil {
+		return fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+	}
+	if strings.TrimSpace(batch.IdempotencyKey) == "" {
+		return fmt.Errorf("%w: plan idempotency key is required", ErrOperationPlanChanged)
+	}
+	if batch.SessionID == "" && strings.TrimSpace(batch.IdempotencyScope) == "" {
+		return fmt.Errorf("%w: stateless plan idempotency scope is required", ErrOperationPlanChanged)
+	}
+	if batch.CreatedAt.IsZero() || len(batch.Steps) == 0 {
+		return fmt.Errorf("%w: plan timestamp and at least one step are required", ErrOperationPlanChanged)
+	}
+	seen := make(map[string]struct{}, len(batch.Steps))
+	for index, step := range batch.Steps {
+		if err := requireCanonicalIdentity(step.ExecutionID, fmt.Sprintf("plan step %d execution id", index)); err != nil {
+			return fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+		}
+		if strings.TrimSpace(step.Name) == "" || strings.TrimSpace(step.ContractID) == "" || len(step.Arguments) == 0 {
+			return fmt.Errorf("%w: plan step %d name, contract id, and arguments are required", ErrOperationPlanChanged, index)
+		}
+		if _, err := decodeExactJSON(step.Arguments); err != nil {
+			return fmt.Errorf("%w: plan step %d arguments are ambiguous or invalid: %v", ErrOperationPlanChanged, index, err)
+		}
+		if _, exists := seen[step.ExecutionID]; exists {
+			return fmt.Errorf("%w: plan repeats execution id %q", ErrOperationPlanChanged, step.ExecutionID)
+		}
+		seen[step.ExecutionID] = struct{}{}
+	}
+	return nil
+}
+
 type OperationPlanSeal struct {
 	RequestID        string
 	SessionID        string
@@ -274,6 +485,26 @@ type OperationPlanSeal struct {
 	IdempotencyScope string
 	BatchCount       uint64
 	SealedAt         time.Time
+}
+
+// Validate checks one immutable write-plan seal.
+func (seal OperationPlanSeal) Validate() error {
+	if err := validateUTF8Boundary("operation plan seal", seal); err != nil {
+		return fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+	}
+	if err := requireCanonicalIdentity(seal.RequestID, "plan request id"); err != nil {
+		return fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+	}
+	if strings.TrimSpace(seal.IdempotencyKey) == "" {
+		return fmt.Errorf("%w: plan idempotency key is required", ErrOperationPlanChanged)
+	}
+	if seal.SessionID == "" && strings.TrimSpace(seal.IdempotencyScope) == "" {
+		return fmt.Errorf("%w: stateless plan idempotency scope is required", ErrOperationPlanChanged)
+	}
+	if seal.SealedAt.IsZero() {
+		return fmt.Errorf("%w: plan seal timestamp is required", ErrOperationPlanChanged)
+	}
+	return nil
 }
 
 type PlanBatchReservation struct {
@@ -428,6 +659,10 @@ func (transition OperationExecutionTransition) Validate() error {
 	if transition.From == OperationExecutionStarted && transition.To == OperationExecutionCompleted && len(transition.Evidence) == 0 {
 		return fmt.Errorf("%w: started completion requires durable reconciliation evidence", ErrInvalidExecutionTransition)
 	}
+	if transition.From == OperationExecutionUnknown &&
+		(transition.To == OperationExecutionCompleted || transition.To == OperationExecutionRetryable) && len(transition.Evidence) == 0 {
+		return fmt.Errorf("%w: resolving an unknown outcome requires durable reconciliation evidence", ErrInvalidExecutionTransition)
+	}
 	switch transition.To {
 	case OperationExecutionExecuted, OperationExecutionCompleted:
 		if len(transition.Result.Output) == 0 {
@@ -493,6 +728,12 @@ func (transition OperationExecutionTransition) validateFields() error {
 // ExecutionStore owns durable write plans and write-operation state. Stores
 // must compare each plan step and execution ContractID and the execution's
 // VerificationRequired bit on every reservation, acquisition, and transition.
+// Each planned ExecutionID belongs to exactly one batch across the store;
+// ReservePlanBatch rejects a second assignment with ErrIdentityConflict before
+// it can make the first plan unexecutable. New batch timestamps never precede
+// an earlier batch, and an initial seal timestamp never precedes its batches.
+// Reservation and seal retries compare semantic identity, retain the first
+// stored observation timestamps, and return them with Created=false.
 // ReservePlanBatch preserves the first batch at each index and rejects new
 // batches after SealPlan. AcquireExecution and TransitionExecution atomically
 // update the current record and append an immutable transition. Every persisted
@@ -509,9 +750,12 @@ func (transition OperationExecutionTransition) validateFields() error {
 // exactly equal to the acquisition event time (with CreatedAt no later than that
 // event so retries can preserve the original creation time), and every
 // TransitionExecution acknowledgement must return UpdatedAt exactly equal to
-// the requested transition time. Started may transition directly to completed
+// the requested transition time. Acquisition and transition timestamps must
+// never move UpdatedAt backward. Started may transition directly to completed
 // only for an evidence-bearing reconciliation of the exact fenced attempt after
 // the executor may have committed but post-effect journaling could not be proved.
+// Unknown may transition to retryable or completed only with durable evidence
+// proving respectively that the side effect was not applied or was committed.
 // ValidateExecutionAttempt rejects owners fenced by reconciliation or retry;
 // write executors must still perform the same check atomically with their
 // external side effect.

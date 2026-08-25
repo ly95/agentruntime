@@ -8,11 +8,13 @@ These examples are small, runnable programs that exercise the public
 | [`basic`](basic/main.go) | A stateless OpenAI-backed agent run without tools |
 | [`operations`](operations/main.go) | A read-only operation registered as a model tool, with host-owned policy and execution |
 | [`skill`](skill/main.go) | An explicit local `SKILL.md` snapshot mounted beside a host-owned operation |
+| [`approval`](approval/main.go) | Offline durable writes: approval resume, safe not-applied handling, and evidence reconciliation |
 
 ## Configure
 
-All examples use the OpenAI Responses API and fail explicitly when required
-configuration is missing.
+The `basic`, `mcp`, and `skill` examples use the OpenAI Responses API and fail
+explicitly when required configuration is missing. The `approval` example is
+fully offline.
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -29,6 +31,7 @@ Run commands from the repository root:
 go run ./examples/basic "Explain agent loops in one paragraph."
 go run ./examples/operations "Use the tool to add 19 and 23."
 go run ./examples/skill "Analyze this text: small tools make agents easier to test."
+go run ./examples/approval
 ```
 
 The operations example registers `math_add` in `OperationRegistry`. The runtime
@@ -41,6 +44,7 @@ snapshot through `RuntimeConfig.Skills`. The host separately registers and
 executes `text_analyze`; mounting a Skill does not grant execution authority.
 Supporting scripts remain inert snapshot files rather than operations.
 
-These examples are stateless and read-only. Production write operations also
-require a durable `ExecutionStore`; confirmation-required writes additionally
-require approval and verification implementations.
+The first three examples are stateless and read-only. The approval example is
+fully offline and uses `InMemoryStore` as executable protocol documentation;
+production hosts must replace it with durable transactional `RunStore` and
+`ExecutionStore` adapters.

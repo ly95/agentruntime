@@ -1,0 +1,13 @@
+data: {"type":"response.created","response":{"id":"resp_golden_call","object":"response","created_at":1,"model":"test-model","status":"in_progress","output":[]},"sequence_number":0}
+
+data: {"type":"response.output_item.added","item":{"id":"fc_golden","type":"function_call","status":"in_progress","call_id":"call_golden","name":"echo","arguments":""},"output_index":0,"sequence_number":1}
+
+data: {"type":"response.function_call_arguments.delta","delta":"{\"value\":\"golden\"}","item_id":"fc_golden","output_index":0,"sequence_number":2}
+
+data: {"type":"response.function_call_arguments.done","arguments":"{\"value\":\"golden\"}","name":"echo","item_id":"fc_golden","output_index":0,"sequence_number":3}
+
+data: {"type":"response.output_item.done","item":{"id":"fc_golden","type":"function_call","status":"completed","call_id":"call_golden","name":"echo","arguments":"{\"value\":\"golden\"}"},"output_index":0,"sequence_number":4}
+
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_golden_call","object":"response","created_at":1,"status":"completed","model":"test-model","output":[{"id":"fc_golden","type":"function_call","status":"completed","call_id":"call_golden","name":"echo","arguments":"{\"value\":\"golden\"}"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}
+
+data: [DONE]

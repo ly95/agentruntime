@@ -78,9 +78,18 @@ func TestRuntimeUsesDetachedContextsForCancellationCleanup(t *testing.T) {
 func TestRuntimeRenewsSessionLeaseWhileModelIsRunning(t *testing.T) {
 	release := make(chan struct{})
 	store := &renewalSignalStore{renewed: make(chan struct{})}
+	renewalEvent := make(chan Event, 1)
 	rt, err := NewRuntime(RuntimeConfig{
 		Model: blockingModel{release: release}, RunStore: store,
 		SessionLeaseTTL: 100 * time.Millisecond, LeaseRenewalInterval: 5 * time.Millisecond,
+		EventSink: func(event Event) {
+			if event.Type == EventSessionLeaseRenewed {
+				select {
+				case renewalEvent <- event:
+				default:
+				}
+			}
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
@@ -107,6 +116,14 @@ func TestRuntimeRenewsSessionLeaseWhileModelIsRunning(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not finish after model release")
+	}
+	select {
+	case event := <-renewalEvent:
+		if event.RunID == "" || event.SessionID != "session-renew" || event.LeaseGeneration == 0 {
+			t.Fatalf("renewal event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session lease renewal event was not emitted")
 	}
 }
 

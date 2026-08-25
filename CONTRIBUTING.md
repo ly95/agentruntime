@@ -19,7 +19,7 @@ boundary or expands the public API.
 
 Requirements:
 
-- Go 1.26 or newer
+- Go 1.25 or newer
 - Git
 
 From the repository root, download dependencies and run the verification suite:
@@ -28,6 +28,7 @@ From the repository root, download dependencies and run the verification suite:
 go mod download
 go test ./...
 go vet ./...
+go test -race ./...
 ```
 
 The examples that call the OpenAI Responses API additionally require

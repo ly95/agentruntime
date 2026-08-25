@@ -50,6 +50,11 @@ type Input struct {
 	TrustedContext string `json:"-"`
 }
 
+// IDFactory creates one canonical runtime identity. Returning an error aborts
+// the current Run or reconciliation operation before the identity is used.
+// Implementations may be called concurrently and must be concurrency-safe.
+type IDFactory func() (string, error)
+
 type RuntimeConfig struct {
 	Model      Model
 	Operations *OperationRegistry
@@ -67,6 +72,9 @@ type RuntimeConfig struct {
 	Executions      ExecutionStore
 	EventSink       EventSink
 	ContextWindow   *ContextWindowConfig
+	// ImageAttachmentResolver is the Runtime-wide fallback for historical
+	// session images. Input.ImageAttachmentResolver overrides it for one Run.
+	ImageAttachmentResolver ImageAttachmentResolver
 
 	MaxIterations        int
 	MaxCallsPerTurn      int
@@ -74,10 +82,17 @@ type RuntimeConfig struct {
 	LeaseRenewalInterval time.Duration
 	CleanupTimeout       time.Duration
 	Now                  func() time.Time
+	// IDFactory is the error-returning identity boundary. A custom factory
+	// requires RunStore as durable uniqueness authority after in-flight claims
+	// retire. IDFactory and the legacy NewID field are mutually exclusive.
+	IDFactory IDFactory
 	// NewID may be invoked concurrently by concurrent Run calls. Implementations
 	// must be concurrency-safe and must not rely on Runtime holding a host-facing
 	// serialization lock while the callback executes. A custom factory requires
 	// RunStore as durable uniqueness authority after in-flight claims retire.
+	//
+	// Deprecated: use IDFactory so entropy and other generation failures can be
+	// returned explicitly.
 	NewID func() string
 }
 
@@ -93,23 +108,24 @@ type runtimeIdentityScope struct {
 type runtimeIdentityScopeContextKey struct{}
 
 type Runtime struct {
-	model            Model
-	operations       *OperationRegistry
-	executor         OperationExecutor
-	policy           OperationPolicy
-	toolInstructions string
-	verifier         ResultVerifier
-	approver         Approver
-	approvalResumer  ApprovalResumer
-	runStore         RunStore
-	executions       ExecutionStore
-	eventSink        EventSink
-	contextWindow    *ContextWindowConfig
-	baseInstructions string
-	skillSetID       string
-	toolSnapshot     []ToolDefinition
-	toolSnapshotID   string
-	operationSetID   string
+	model                   Model
+	operations              *OperationRegistry
+	executor                OperationExecutor
+	policy                  OperationPolicy
+	toolInstructions        string
+	verifier                ResultVerifier
+	approver                Approver
+	approvalResumer         ApprovalResumer
+	runStore                RunStore
+	executions              ExecutionStore
+	eventSink               EventSink
+	contextWindow           *ContextWindowConfig
+	imageAttachmentResolver ImageAttachmentResolver
+	baseInstructions        string
+	skillSetID              string
+	toolSnapshot            []ToolDefinition
+	toolSnapshotID          string
+	operationSetID          string
 
 	maxIterations        int
 	maxCallsPerTurn      int
@@ -117,20 +133,21 @@ type Runtime struct {
 	leaseRenewalInterval time.Duration
 	cleanupTimeout       time.Duration
 	now                  func() time.Time
-	newID                func() string
+	newID                IDFactory
 	identityMu           sync.Mutex
 	assignedIdentities   map[string]runtimeIdentityClaim
 }
 
 type Result struct {
-	RunID                 string
-	SessionID             string
-	Status                RunStatus
-	LastResponseID        string
-	Output                string
-	Artifacts             []ResultArtifact
-	ErrorCode             string
-	PendingApprovalDigest string
+	RunID                 string                  `json:"run_id"`
+	SessionID             string                  `json:"session_id,omitempty"`
+	Status                RunStatus               `json:"status"`
+	LastResponseID        string                  `json:"last_response_id,omitempty"`
+	Output                string                  `json:"output,omitempty"`
+	Artifacts             []ResultArtifact        `json:"artifacts,omitempty"`
+	ErrorCode             string                  `json:"error_code,omitempty"`
+	PendingApprovalDigest string                  `json:"pending_approval_digest,omitempty"`
+	PendingApproval       *PendingApprovalSummary `json:"pending_approval,omitempty"`
 }
 
 type agentState struct {
@@ -174,7 +191,8 @@ func correlateOperationError(callID, executionID, attemptID string, cause error)
 	if cause == nil {
 		return nil
 	}
-	if _, ok := errors.AsType[*operationCallError](cause); ok {
+	var existing *operationCallError
+	if errors.As(cause, &existing) {
 		return cause
 	}
 	return &operationCallError{callID: callID, executionID: executionID, attemptID: attemptID, cause: cause}
@@ -187,7 +205,8 @@ func correlateModelCallError(modelCallID string, cause error) error {
 	if cause == nil || modelCallID == "" {
 		return cause
 	}
-	if _, ok := errors.AsType[*modelCallError](cause); ok {
+	var existing *modelCallError
+	if errors.As(cause, &existing) {
 		return cause
 	}
 	return &modelCallError{modelCallID: modelCallID, cause: cause}
@@ -200,7 +219,7 @@ type runtimeSettings struct {
 	leaseRenewalInterval time.Duration
 	cleanupTimeout       time.Duration
 	now                  func() time.Time
-	newID                func() string
+	newID                IDFactory
 	contextWindow        *ContextWindowConfig
 }
 
@@ -223,8 +242,14 @@ func validateRuntimeDependencies(cfg RuntimeConfig) error {
 	if isNilDependency(cfg.Model) {
 		return errors.New("agent: model is required")
 	}
+	if cfg.IDFactory != nil && cfg.NewID != nil {
+		return errors.New("agent: configure only one of IDFactory or legacy NewID")
+	}
 	if cfg.NewID != nil && isNilDependency(cfg.RunStore) {
 		return errors.New("agent: custom NewID requires RunStore durable identity authority")
+	}
+	if cfg.IDFactory != nil && isNilDependency(cfg.RunStore) {
+		return errors.New("agent: custom IDFactory requires RunStore durable identity authority")
 	}
 	optionalDependencies := []struct {
 		name  string
@@ -237,6 +262,7 @@ func validateRuntimeDependencies(cfg RuntimeConfig) error {
 		{name: "approval resumer", value: cfg.ApprovalResumer},
 		{name: "run store", value: cfg.RunStore},
 		{name: "execution store", value: cfg.Executions},
+		{name: "image attachment resolver", value: cfg.ImageAttachmentResolver},
 	}
 	for _, dependency := range optionalDependencies {
 		if dependency.value != nil && isNilDependency(dependency.value) {
@@ -257,7 +283,7 @@ func normalizeRuntimeSettings(cfg RuntimeConfig) (runtimeSettings, error) {
 		leaseRenewalInterval: cfg.LeaseRenewalInterval,
 		cleanupTimeout:       cfg.CleanupTimeout,
 		now:                  cfg.Now,
-		newID:                cfg.NewID,
+		newID:                cfg.IDFactory,
 	}
 	if settings.maxIterations == 0 {
 		settings.maxIterations = defaultMaxIterations
@@ -273,6 +299,9 @@ func normalizeRuntimeSettings(cfg RuntimeConfig) (runtimeSettings, error) {
 	}
 	if settings.now == nil {
 		settings.now = time.Now
+	}
+	if settings.newID == nil && cfg.NewID != nil {
+		settings.newID = func() (string, error) { return cfg.NewID(), nil }
 	}
 	if settings.newID == nil {
 		settings.newID = randomID
@@ -358,33 +387,35 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{
-		model:                cfg.Model,
-		operations:           catalog.operations,
-		executor:             catalog.executor,
-		policy:               cfg.Policy,
-		toolInstructions:     catalog.toolInstructions,
-		verifier:             cfg.Verifier,
-		approver:             cfg.Approver,
-		approvalResumer:      cfg.ApprovalResumer,
-		runStore:             cfg.RunStore,
-		executions:           cfg.Executions,
-		eventSink:            cfg.EventSink,
-		contextWindow:        settings.contextWindow,
-		baseInstructions:     catalog.baseInstructions,
-		skillSetID:           catalog.skillSetID,
-		toolSnapshot:         catalog.toolSnapshot,
-		toolSnapshotID:       toolDefinitionsID(catalog.toolSnapshot),
-		operationSetID:       catalog.operationSetID,
-		maxIterations:        settings.maxIterations,
-		maxCallsPerTurn:      settings.maxCallsPerTurn,
-		sessionLeaseTTL:      settings.sessionLeaseTTL,
-		leaseRenewalInterval: settings.leaseRenewalInterval,
-		cleanupTimeout:       settings.cleanupTimeout,
-		now:                  settings.now,
-		newID:                settings.newID,
-		assignedIdentities:   make(map[string]runtimeIdentityClaim),
-	}, nil
+	runtime := &Runtime{
+		model:                   cfg.Model,
+		operations:              catalog.operations,
+		executor:                catalog.executor,
+		policy:                  cfg.Policy,
+		toolInstructions:        catalog.toolInstructions,
+		verifier:                cfg.Verifier,
+		approver:                cfg.Approver,
+		approvalResumer:         cfg.ApprovalResumer,
+		runStore:                cfg.RunStore,
+		executions:              cfg.Executions,
+		eventSink:               NewEventDispatcher(cfg.EventSink).EventSink(),
+		contextWindow:           settings.contextWindow,
+		imageAttachmentResolver: cfg.ImageAttachmentResolver,
+		baseInstructions:        catalog.baseInstructions,
+		skillSetID:              catalog.skillSetID,
+		toolSnapshot:            catalog.toolSnapshot,
+		toolSnapshotID:          toolDefinitionsID(catalog.toolSnapshot),
+		operationSetID:          catalog.operationSetID,
+		maxIterations:           settings.maxIterations,
+		maxCallsPerTurn:         settings.maxCallsPerTurn,
+		sessionLeaseTTL:         settings.sessionLeaseTTL,
+		leaseRenewalInterval:    settings.leaseRenewalInterval,
+		cleanupTimeout:          settings.cleanupTimeout,
+		now:                     settings.now,
+		newID:                   settings.newID,
+		assignedIdentities:      make(map[string]runtimeIdentityClaim),
+	}
+	return runtime, nil
 }
 
 // nextGeneratedID is the single trust boundary for host-provided identity
@@ -396,7 +427,10 @@ func (r *Runtime) nextGeneratedID(ctx context.Context, kind string) (string, err
 	if r == nil || r.newID == nil {
 		return "", fmt.Errorf("agent: generated %s has no identity factory", kind)
 	}
-	id := r.newID()
+	id, err := r.newID()
+	if err != nil {
+		return "", fmt.Errorf("agent: generate %s: %w", kind, validateUTF8Error("identity factory", err))
+	}
 	if err := validateRuntimeIdentity(id, "generated "+kind); err != nil {
 		return "", err
 	}

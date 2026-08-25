@@ -245,10 +245,6 @@ type sharedRoot struct {
 
 func (root *sharedRoot) FS() fs.FS { return root.root }
 
-func (root *sharedRoot) inspect(relative string) (os.FileInfo, error) {
-	return root.root.Stat(relative)
-}
-
 func (root *sharedRoot) sub(relative string) (*rootArtifactFS, error) {
 	return root.root.sub(relative)
 }

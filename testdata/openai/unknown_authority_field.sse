@@ -1,0 +1,3 @@
+data: {"type":"response.created","response":{"id":"resp_golden_invalid","object":"response","created_at":1,"model":"test-model","status":"in_progress","output":[],"future_authority":true},"sequence_number":0}
+
+data: [DONE]

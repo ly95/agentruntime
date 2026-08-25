@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRuntimeResumesApprovalWithCanonicalizedDefaultInput(t *testing.T) {
@@ -87,6 +88,66 @@ func TestRuntimeResumesApprovalWithCanonicalizedDefaultInput(t *testing.T) {
 	}
 	if executionID == "" || executionID != approver.request.Operation.ExecutionID {
 		t.Fatalf("execution_id=%q approval_execution_id=%q", executionID, approver.request.Operation.ExecutionID)
+	}
+}
+
+func TestInMemoryStoreApprovalResumePreservesRunCreationTime(t *testing.T) {
+	now := time.Date(2026, time.August, 25, 9, 0, 0, 0, time.UTC)
+	store, err := NewInMemoryStoreWithConfig(InMemoryStoreConfig{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &scriptedModel{responses: []*ModelResponse{
+		callResponse("response-created-at-1", ToolCall{ID: "call-created-at", Name: "apply_change", Input: json.RawMessage(`{}`)}),
+		messageResponse("response-created-at-2", "done"),
+	}}
+	operations := NewOperationRegistry()
+	if err := operations.Register(operation("apply_change", OperationEffectWrite)); err != nil {
+		t.Fatal(err)
+	}
+	approver := &resumableApprover{}
+	sequence := 0
+	runtime, err := NewRuntime(RuntimeConfig{
+		Model: model, Operations: operations,
+		Policy: OperationPolicyFunc(func(context.Context, OperationRequest) (PolicyDecision, error) {
+			return PolicyDecision{Action: PolicyRequireApproval, Reason: "write operation"}, nil
+		}),
+		Executor: OperationExecutorFunc(func(context.Context, OperationRequest) (OperationResult, error) {
+			return OperationResult{Output: json.RawMessage(`{"applied":true}`)}, nil
+		}),
+		Verifier: confirmingVerifier(), Approver: approver, ApprovalResumer: approver,
+		RunStore: store, Executions: store, Now: func() time.Time { return now },
+		NewID: func() string {
+			sequence++
+			return fmt.Sprintf("created-at-id-%d", sequence)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := Input{
+		RunID: "run-created-at", SessionID: "session-created-at", User: "apply",
+		IdempotencyKey: "created-at-key", IdempotencyScope: "test",
+	}
+	first, err := runtime.Run(t.Context(), input)
+	if err != nil || first.Status != RunStatusWaitingUser {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	waiting, err := store.GetRun(t.Context(), input.RunID)
+	if err != nil || !waiting.CreatedAt.Equal(now) {
+		t.Fatalf("waiting run=%+v err=%v", waiting, err)
+	}
+	originalCreatedAt := waiting.CreatedAt
+
+	now = now.Add(time.Hour)
+	approver.resolve(true, "approved")
+	completed, err := runtime.ResumeApproval(t.Context(), input)
+	if err != nil || completed.Status != RunStatusCompleted {
+		t.Fatalf("completed=%+v err=%v", completed, err)
+	}
+	stored, err := store.GetRun(t.Context(), input.RunID)
+	if err != nil || stored.Status != RunStatusCompleted || !stored.CreatedAt.Equal(originalCreatedAt) || !stored.UpdatedAt.Equal(now) {
+		t.Fatalf("stored run=%+v err=%v", stored, err)
 	}
 }
 

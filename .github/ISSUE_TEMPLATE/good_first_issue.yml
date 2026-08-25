@@ -1,0 +1,19 @@
+name: Good first issue proposal
+description: Propose a bounded documentation, test, or adapter-fixture improvement.
+title: "[Good first issue]: "
+labels: ["good first issue", "needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Small, self-contained problem
+      description: Explain the runtime-level gap and the files or tests involved.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance checks
+      description: List deterministic tests or documentation evidence that finish the work.
+    validations:
+      required: true
