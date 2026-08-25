@@ -592,12 +592,6 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 	active := r.startActiveRunLease(ctx, &run, state)
 	defer active.stop()
 	r.emit(Event{Type: EventRunStarted, RunID: run.ID, SessionID: run.SessionID})
-	mcpInfo := r.mcp.ServerInfo()
-	r.emit(Event{
-		Type: EventMCPConnected, RunID: run.ID, SessionID: run.SessionID,
-		MCPServer: mcpInfo.Name, MCPVersion: mcpInfo.Version,
-		MCPProtocol: mcpInfo.ProtocolVersion, MCPToolCount: len(r.toolSnapshot),
-	})
 	stableState := captureRunState(state)
 	approvalResume, err := r.prepareApprovalResume(active.runContext, &run, state, input)
 	if err != nil {
@@ -612,7 +606,7 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 		return active.wait()
 	}
 
-	// MCP negotiation and its server instructions are fixed for this Runtime.
+	// Tool contracts and instructions are fixed for this Runtime.
 	// Later failures roll back only per-run model and transcript mutations.
 	stableState = captureRunState(state)
 	if approvalResume == nil {

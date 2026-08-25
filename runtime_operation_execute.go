@@ -374,7 +374,11 @@ func (r *Runtime) executeAndValidateOperation(ctx context.Context, run *RunRecor
 			}
 			return nil, err
 		}
-		attempt.result, err = r.mcp.Execute(ctx, executorReq)
+		if isNilDependency(r.executor) {
+			err = errors.New("agent: operation executor is required")
+		} else {
+			attempt.result, err = r.executor.Execute(ctx, executorReq)
+		}
 		if err != nil {
 			err = validateUTF8Error("operation executor", err)
 			if operation.operation.Effect == OperationEffectWrite && errors.Is(err, ErrOperationNotApplied) {

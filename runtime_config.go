@@ -51,9 +51,12 @@ type Input struct {
 }
 
 type RuntimeConfig struct {
-	Model           Model
-	Operations      *OperationRegistry
-	MCPInstructions string
+	Model      Model
+	Operations *OperationRegistry
+	// Instructions are host-authored tool-use rules merged into the frozen
+	// system prompt. They are not MCP server instructions; tool contracts come
+	// from OperationRegistry.
+	Instructions    string
 	Skills          *skills.SkillSet
 	Policy          OperationPolicy
 	Executor        OperationExecutor
@@ -92,8 +95,9 @@ type runtimeIdentityScopeContextKey struct{}
 type Runtime struct {
 	model            Model
 	operations       *OperationRegistry
-	mcp              *localMCP
+	executor         OperationExecutor
 	policy           OperationPolicy
+	toolInstructions string
 	verifier         ResultVerifier
 	approver         Approver
 	approvalResumer  ApprovalResumer
@@ -119,11 +123,14 @@ type Runtime struct {
 }
 
 type Result struct {
-	RunID          string
-	SessionID      string
-	Status         RunStatus
-	LastResponseID string
-	Output         string
+	RunID                 string
+	SessionID             string
+	Status                RunStatus
+	LastResponseID        string
+	Output                string
+	Artifacts             []ResultArtifact
+	ErrorCode             string
+	PendingApprovalDigest string
 }
 
 type agentState struct {
@@ -199,8 +206,9 @@ type runtimeSettings struct {
 
 type runtimeCatalog struct {
 	operations       *OperationRegistry
-	mcp              *localMCP
+	executor         OperationExecutor
 	baseInstructions string
+	toolInstructions string
 	skillSetID       string
 	toolSnapshot     []ToolDefinition
 	operationSetID   string
@@ -208,8 +216,8 @@ type runtimeCatalog struct {
 
 func validateRuntimeDependencies(cfg RuntimeConfig) error {
 	if err := validateUTF8Boundary("runtime configuration", struct {
-		MCPInstructions string
-	}{MCPInstructions: cfg.MCPInstructions}); err != nil {
+		Instructions string
+	}{Instructions: cfg.Instructions}); err != nil {
 		return err
 	}
 	if isNilDependency(cfg.Model) {
@@ -310,13 +318,9 @@ func prepareRuntimeCatalog(cfg RuntimeConfig) (runtimeCatalog, error) {
 	if err := validateRuntimeOperationConfig(operationSummaries, cfg); err != nil {
 		return runtimeCatalog{}, err
 	}
-	var err error
-	catalog.mcp, err = newLocalMCP(
-		catalog.operations, cfg.Executor, cfg.MCPInstructions,
-	)
-	if err != nil {
-		return runtimeCatalog{}, err
-	}
+	catalog.executor = cfg.Executor
+	catalog.toolSnapshot = toolDefinitionsFromOperations(catalog.operations)
+	catalog.toolInstructions = buildToolInstructions(cfg.Instructions)
 	skillInstructions := ""
 	if cfg.Skills != nil && cfg.Skills.Len() > 0 {
 		catalog.skillSetID = cfg.Skills.ID()
@@ -326,8 +330,7 @@ func prepareRuntimeCatalog(cfg RuntimeConfig) (runtimeCatalog, error) {
 			return runtimeCatalog{}, skillErr
 		}
 	}
-	catalog.baseInstructions = buildBaseInstructions(catalog.mcp.Instructions(), skillInstructions)
-	catalog.toolSnapshot = catalog.mcp.Tools()
+	catalog.baseInstructions = buildBaseInstructions(catalog.toolInstructions, skillInstructions)
 	catalog.operationSetID = operationSetID(operationSummaries)
 	if err := validateUTF8Boundary("runtime catalog", struct {
 		Instructions   string
@@ -358,8 +361,9 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	return &Runtime{
 		model:                cfg.Model,
 		operations:           catalog.operations,
-		mcp:                  catalog.mcp,
+		executor:             catalog.executor,
 		policy:               cfg.Policy,
+		toolInstructions:     catalog.toolInstructions,
 		verifier:             cfg.Verifier,
 		approver:             cfg.Approver,
 		approvalResumer:      cfg.ApprovalResumer,

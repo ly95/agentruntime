@@ -14,7 +14,7 @@ body:
   - type: textarea
     id: boundary
     attributes:
-      label: Why this belongs in agent-go
+      label: Why this belongs in agentruntime
       description: Explain why the behavior is business-neutral and cannot remain in the host application.
     validations:
       required: true

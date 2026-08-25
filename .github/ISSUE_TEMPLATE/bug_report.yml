@@ -11,7 +11,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: agent-go version
+      label: agentruntime version
       description: Provide a tag, pseudo-version, or commit SHA.
       placeholder: v0.1.0
     validations:

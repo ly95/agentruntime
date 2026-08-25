@@ -34,7 +34,6 @@ var (
 	ErrContextLimitExceeded       = errors.New("agent: context limit exceeded")
 	ErrContextCompactionFailed    = errors.New("agent: context compaction failed")
 	ErrImageAttachmentUnavailable = errors.New("agent: image attachment unavailable")
-	ErrInsufficientCredits        = errors.New("agent: insufficient credits")
 	ErrRunInterrupted             = errors.New("agent: run interrupted")
 	ErrRunCancelled               = errors.New("agent: run cancelled")
 )
@@ -113,8 +112,6 @@ func errorCode(err error) string {
 		return "context_compaction_failed"
 	case errors.Is(err, ErrImageAttachmentUnavailable):
 		return "image_attachment_unavailable"
-	case errors.Is(err, ErrInsufficientCredits):
-		return "insufficient_credits"
 	case errors.Is(err, ErrRunInterrupted):
 		return "run_interrupted"
 	case errors.Is(err, ErrRunCancelled):
