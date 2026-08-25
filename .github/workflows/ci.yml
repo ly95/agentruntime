@@ -29,6 +29,33 @@ jobs:
           cache: true
       - run: go test -race ./...
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Check gofmt
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+      - name: Check repository contracts
+        env:
+          CHECK_REMOTE_LINKS: "1"
+        run: bash scripts/check-repository-contracts.sh
+
+  api-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Reject incompatible public API changes
+        run: go run golang.org/x/exp/cmd/apidiff@v0.0.0-20260824195058-e88cd73687aa -m -incompatible api/v0.1.0.txt github.com/ly95/agentruntime
+
   cross-compile:
     runs-on: ubuntu-latest
     strategy:

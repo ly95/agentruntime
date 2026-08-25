@@ -296,6 +296,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report
 vulnerabilities according to [SECURITY.md](SECURITY.md), not through a public
 issue.
 
+## Releases, support, and roadmap
+
+The source contract version is exposed as `agentruntime.Version`; Git tags use
+the same semantic version with a leading `v`. Release notes and the checked-in
+public API baseline are gated in CI before a tag is published.
+
+- [Changelog](CHANGELOG.md)
+- [Support policy](SUPPORT.md)
+- [Roadmap and known limits](ROADMAP.md)
+- [v0.1.0 release notes](docs/releases/v0.1.0.md)
+
 ## License
 
 `agentruntime` is available under the [MIT License](LICENSE).

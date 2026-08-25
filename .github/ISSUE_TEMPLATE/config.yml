@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Support policy
+    url: https://github.com/ly95/agentruntime/blob/main/SUPPORT.md
+    about: Review supported versions and the information to include in a support request.
   - name: Report a security vulnerability
     url: https://github.com/ly95/agentruntime/security/advisories/new
     about: Report suspected vulnerabilities privately instead of opening a public issue.

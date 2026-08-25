@@ -1,0 +1,30 @@
+name: Support request
+description: Ask a business-neutral runtime integration question.
+title: "[Support]: "
+labels:
+  - support
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private user data, raw approval arguments, or vulnerability details.
+  - type: input
+    id: version
+    attributes:
+      label: agentruntime and Go versions
+      placeholder: v0.1.0; Go 1.26.0
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Integration goal
+      description: Describe the runtime-level behavior you are trying to implement.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Minimal sanitized evidence
+      description: Include stable error codes and event types without trusted payloads.
+    validations:
+      required: true

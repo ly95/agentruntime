@@ -1,0 +1,38 @@
+name: Store adapter design
+description: Propose or discuss a RunStore or ExecutionStore adapter mapping.
+title: "[Store]: "
+labels:
+  - store
+  - roadmap
+body:
+  - type: input
+    id: backend
+    attributes:
+      label: Backend and isolation level
+      placeholder: PostgreSQL, serializable
+    validations:
+      required: true
+  - type: dropdown
+    id: port
+    attributes:
+      label: Store port
+      options:
+        - RunStore
+        - ExecutionStore
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: mapping
+    attributes:
+      label: Transaction and fencing mapping
+      description: Explain callbacks, identities, leases, attempts, atomic commits, replay, and reconciliation.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Deterministic evidence
+      description: List tests or traces that prove rejection is atomic and replay is idempotent.
+    validations:
+      required: true
