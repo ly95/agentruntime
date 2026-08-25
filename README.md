@@ -85,7 +85,7 @@ transition acknowledgements, and reconciliation.
 go get github.com/ly95/agentruntime@latest
 ```
 
-The module requires Go 1.25 or newer.
+The module requires Go 1.26 or newer.
 
 ## Quick start
 
@@ -298,7 +298,7 @@ above.
 go test ./...
 go vet ./...
 go test -race ./...
-GOTOOLCHAIN=go1.26.0 go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+GOTOOLCHAIN=go1.26.0 go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. Report

@@ -19,7 +19,7 @@ Before bumping `openai-go`:
 1. run `go test ./...` against `testdata/openai/*.sse`;
 2. add a golden stream for each newly accepted lifecycle/union shape;
 3. keep a negative golden for new authority fields until validation is updated;
-4. run fuzz, race, Go 1.25, Windows, and macOS CI;
+4. run fuzz, race, Go 1.26, Windows, and macOS CI;
 5. run the public API diff and classify every reported change in release notes.
 
 Golden files are provider protocol evidence, not snapshots to regenerate

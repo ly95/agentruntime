@@ -19,7 +19,7 @@ boundary or expands the public API.
 
 Requirements:
 
-- Go 1.25 or newer
+- Go 1.26 or newer
 - Git
 
 From the repository root, download dependencies and run the verification suite:
