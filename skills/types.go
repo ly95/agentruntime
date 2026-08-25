@@ -57,7 +57,7 @@ func DefaultLimits() Limits {
 // Source resolves explicitly configured locations into Skill-root artifacts.
 // A custom Source is a trusted host adapter: it must return an immutable
 // snapshot or an FS that confines and identity-checks every open. Artifacts
-// returned by the built-in sources must either be consumed through LoadSet,
+// returned by the built-in local source must either be consumed through LoadSet,
 // which releases source-owned filesystem handles after copying, or closed by
 // calling Close on every returned Artifact. LoadSet owns parsing, validation,
 // copying, limits, conflicts, and hashing.
@@ -68,9 +68,9 @@ type Source interface {
 
 // Artifact is a transient source result. FS must be rooted at a directory
 // containing SKILL.md and satisfy Source's snapshot/confinement contract.
-// LoadSet copies every file, closes built-in source resources, and never retains
-// FS. Callers that invoke a built-in Source's Resolve method directly must call
-// Close on every returned Artifact. Close is idempotent and is a no-op for
+// LoadSet copies every file, closes built-in local-source resources, and never
+// retains FS. Callers that invoke LocalSource.Resolve directly must call Close
+// on every returned Artifact. Close is idempotent and is a no-op for
 // caller-owned custom-source filesystems.
 type Artifact struct {
 	SourceID string
@@ -79,7 +79,7 @@ type Artifact struct {
 	FS       fs.FS
 }
 
-// Close releases filesystem resources owned by a built-in Source.
+// Close releases filesystem resources owned by the built-in local source.
 func (artifact Artifact) Close() error {
 	if closer, ok := artifact.FS.(artifactFSCloser); ok {
 		return closer.closeArtifactFS()

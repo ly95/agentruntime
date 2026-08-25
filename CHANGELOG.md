@@ -16,8 +16,8 @@ include explicit compatibility guidance.
   factory.
 - Safe event dispatch, metrics mapping, OpenTelemetry integration, lease and
   reconciliation events, and provider token usage fields.
-- A bounded HTTP GitHub Skill fetcher, immutable Skill resources, and an
-  offline approval, retry, and reconciliation example.
+- Immutable Skill resources and an offline approval, retry, and reconciliation
+  example.
 
 ### Changed
 
@@ -25,6 +25,12 @@ include explicit compatibility guidance.
   item or explicitly record `audit_missing`.
 - OpenAI semantic validation is split by protocol domain and protected by a
   checked-in golden stream corpus.
+
+### Removed
+
+- Built-in GitHub Skill loading (`NewGitHubSource`, `GitHubFetcher`,
+  `HTTPGitHubFetcher`, and related types). Mount Skills from explicit local
+  directories; a host that needs remote content snapshots it itself.
 
 ### Deprecated
 

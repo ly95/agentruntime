@@ -3,17 +3,12 @@ package skills
 import (
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
-
-const testCommitSHA = "0123456789abcdef0123456789abcdef01234567"
 
 func TestLocalSourceLoadsOnlyExplicitAbsoluteDirectories(t *testing.T) {
 	requireDescriptorRoot(t)
@@ -45,45 +40,24 @@ func TestLocalSourceLoadsOnlyExplicitAbsoluteDirectories(t *testing.T) {
 	}
 }
 
-func TestBuiltInSourcesAcceptEmptyFileAtExactSkillByteLimit(t *testing.T) {
+func TestLocalSourceAcceptsEmptyFileAtExactSkillByteLimit(t *testing.T) {
+	requireDescriptorRoot(t)
 	markdown := skillMarkdown("exact-built-in", "Exact built-in boundary.", "Body.")
 	limits := DefaultLimits()
 	limits.MaxSkillBytes = int64(len(markdown))
-
-	t.Run("local", func(t *testing.T) {
-		requireDescriptorRoot(t)
-		root := testTempDir(t)
-		directory := writeSkillDirectory(t, root, "skill", "exact-built-in", "Exact built-in boundary.", "Body.", map[string]string{"empty.txt": ""})
-		set, err := LoadSetWithLimits(t.Context(), limits, NewLocalSource(LocalSourceConfig{ID: "local", Directories: []string{directory}}))
-		if err != nil || set == nil || set.Len() != 1 {
-			t.Fatalf("set=%v error=%v", set, err)
-		}
-	})
-
-	t.Run("github", func(t *testing.T) {
-		fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{CommitSHA: testCommitSHA, Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(markdown)},
-			{Path: "empty.txt", Data: []byte{}},
-		}}}
-		set, err := LoadSetWithLimits(t.Context(), limits, NewGitHubSource(GitHubSourceConfig{
-			ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/exact", Fetcher: fetcher,
-		}))
-		if err != nil || set == nil || set.Len() != 1 {
-			t.Fatalf("set=%v error=%v", set, err)
-		}
-	})
+	root := testTempDir(t)
+	directory := writeSkillDirectory(t, root, "skill", "exact-built-in", "Exact built-in boundary.", "Body.", map[string]string{"empty.txt": ""})
+	set, err := LoadSetWithLimits(t.Context(), limits, NewLocalSource(LocalSourceConfig{ID: "local", Directories: []string{directory}}))
+	if err != nil || set == nil || set.Len() != 1 {
+		t.Fatalf("set=%v error=%v", set, err)
+	}
 }
 
-func TestBuiltInSourceResolveRejectsNilContext(t *testing.T) {
-	sources := []Source{
-		NewLocalSource(LocalSourceConfig{ID: "local"}),
-		NewGitHubSource(GitHubSourceConfig{ID: "github"}),
-	}
-	for _, source := range sources {
-		//lint:ignore SA1012 This test verifies that every built-in Source rejects a nil context explicitly.
-		if artifacts, err := source.Resolve(nil); err == nil || artifacts != nil || !errors.Is(err, ErrInvalidSource) {
-			t.Fatalf("source=%T artifacts=%v error=%v", source, artifacts, err)
-		}
+func TestLocalSourceResolveRejectsNilContext(t *testing.T) {
+	source := NewLocalSource(LocalSourceConfig{ID: "local"})
+	//lint:ignore SA1012 This test verifies that LocalSource rejects a nil context explicitly.
+	if artifacts, err := source.Resolve(nil); err == nil || artifacts != nil || !errors.Is(err, ErrInvalidSource) {
+		t.Fatalf("artifacts=%v error=%v", artifacts, err)
 	}
 }
 
@@ -121,7 +95,7 @@ func TestLocalSourceRejectsInvalidDirectoriesAtomically(t *testing.T) {
 	}
 }
 
-func TestBuiltInSourcesRejectNonCanonicalConfiguredDirectories(t *testing.T) {
+func TestLocalSourceRejectsNonCanonicalConfiguredDirectories(t *testing.T) {
 	requireDescriptorRoot(t)
 	root := testTempDir(t)
 	local := writeSkillDirectory(t, root, "canonical-local", "canonical-local", "Canonical local.", "Body.", nil)
@@ -213,7 +187,7 @@ func TestConfiguredRootsRejectSymbolicLinkComponents(t *testing.T) {
 	}
 }
 
-func TestBuiltInResolveArtifactsAreCallerClosable(t *testing.T) {
+func TestLocalSourceResolveArtifactsAreCallerClosable(t *testing.T) {
 	requireDescriptorRoot(t)
 	root := testTempDir(t)
 	localSkill := writeSkillDirectory(t, root, "local", "local-close", "Local close.", "Body.", nil)
@@ -238,248 +212,6 @@ func TestBuiltInResolveArtifactsAreCallerClosable(t *testing.T) {
 	if file, err := artifacts[0].FS.Open("SKILL.md"); err == nil {
 		_ = file.Close()
 		t.Fatal("artifact filesystem remained usable after Close")
-	}
-}
-
-func TestGitHubSourceUsesInjectedFetcherAndResolvedCommit(t *testing.T) {
-	fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{
-		CommitSHA: testCommitSHA,
-		Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(skillMarkdown("security-review", "Review security changes.", "Trace inputs to sinks."))},
-			{Path: "scripts/check.sh", Data: []byte("must-not-run")},
-		},
-	}}
-	set, err := LoadSet(t.Context(), NewGitHubSource(GitHubSourceConfig{
-		ID: "github", Repository: "owner/repository", Ref: "v1.2.0", Path: "skills/security-review", Fetcher: fetcher,
-	}))
-	if err != nil {
-		t.Fatalf("LoadSet: %v", err)
-	}
-	if len(fetcher.requests) != 1 || fetcher.requests[0] != (GitHubFetchRequest{Repository: "owner/repository", Ref: "v1.2.0", Path: "skills/security-review"}) {
-		t.Fatalf("requests=%+v", fetcher.requests)
-	}
-	skill := set.Skills()[0]
-	if skill.Revision() != testCommitSHA || skill.Locator() != "owner/repository@"+testCommitSHA+":skills/security-review" {
-		t.Fatalf("revision=%q locator=%q", skill.Revision(), skill.Locator())
-	}
-}
-
-func TestGitHubSourceCopiesFetcherFilesBeforeParsing(t *testing.T) {
-	markdown := []byte(skillMarkdown("immutable", "Immutable snapshot.", "Original body."))
-	files := []GitHubFile{{Path: "SKILL.md", Data: markdown}}
-	fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{CommitSHA: testCommitSHA, Files: files}}
-	source := afterResolveSource{
-		source: NewGitHubSource(GitHubSourceConfig{
-			ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/immutable", Fetcher: fetcher,
-		}),
-		after: func() {
-			for index := range markdown {
-				markdown[index] = 'x'
-			}
-			files[0].Path = "redirected.md"
-			files[0].Data = []byte("replacement")
-		},
-	}
-	set, err := LoadSet(t.Context(), source)
-	if err != nil {
-		t.Fatalf("LoadSet: %v", err)
-	}
-	if set.Len() != 1 || set.Skills()[0].Name() != "immutable" || set.Skills()[0].Instructions() != "Original body." {
-		t.Fatalf("set=%+v", set)
-	}
-}
-
-func TestGitHubSourceRejectsMalformedFileSnapshots(t *testing.T) {
-	skill := GitHubFile{Path: "SKILL.md", Data: []byte(skillMarkdown("malformed", "Malformed provider output.", "Body."))}
-	tests := []struct {
-		name  string
-		files []GitHubFile
-	}{
-		{name: "parent traversal", files: []GitHubFile{skill, {Path: "../secret", Data: []byte("secret")}}},
-		{name: "absolute path", files: []GitHubFile{skill, {Path: "/secret", Data: []byte("secret")}}},
-		{name: "duplicate", files: []GitHubFile{skill, skill}},
-		{name: "file before child", files: []GitHubFile{skill, {Path: "collision", Data: []byte("file")}, {Path: "collision/child", Data: []byte("child")}}},
-		{name: "child before file", files: []GitHubFile{skill, {Path: "collision/child", Data: []byte("child")}, {Path: "collision", Data: []byte("file")}}},
-		{name: "symbolic link", files: []GitHubFile{skill, {Path: "link", Data: []byte("target"), Mode: fs.ModeSymlink}}},
-		{name: "directory", files: []GitHubFile{skill, {Path: "directory", Mode: fs.ModeDir}}},
-		{name: "submodule", files: []GitHubFile{skill, {Path: "module", Mode: fs.ModeIrregular}}},
-		{name: "raw Git regular mode", files: []GitHubFile{skill, {Path: "regular", Mode: 0o100644}}},
-		{name: "raw Git symbolic-link mode", files: []GitHubFile{skill, {Path: "link", Mode: 0o120000}}},
-		{name: "raw Git submodule mode", files: []GitHubFile{skill, {Path: "module", Mode: 0o160000}}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{CommitSHA: testCommitSHA, Files: test.files}}
-			set, err := LoadSet(t.Context(), NewGitHubSource(GitHubSourceConfig{
-				ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/malformed", Fetcher: fetcher,
-			}))
-			if err == nil || set != nil || !errors.Is(err, ErrInvalidArtifact) {
-				t.Fatalf("set=%v error=%v", set, err)
-			}
-		})
-	}
-}
-
-func TestGitHubSnapshotReadDirHandlesMaxIntCount(t *testing.T) {
-	filesystem, err := newGitHubSnapshot([]GitHubFile{
-		{Path: "SKILL.md", Data: []byte(skillMarkdown("directory-count", "Directory count.", "Body."))},
-		{Path: "one.txt", Data: []byte("one")},
-		{Path: "two.txt", Data: []byte("two")},
-	}, DefaultLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	opened, err := filesystem.Open(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	directory := opened.(fs.ReadDirFile)
-	first, err := directory.ReadDir(1)
-	if err != nil || len(first) != 1 {
-		t.Fatalf("first=%v error=%v", first, err)
-	}
-	rest, err := directory.ReadDir(math.MaxInt)
-	if err != nil || len(rest) != 2 {
-		t.Fatalf("rest=%v error=%v", rest, err)
-	}
-}
-
-func TestGitHubSourceRejectsStructuralLimitAmplification(t *testing.T) {
-	limits := DefaultLimits()
-	deepPath := strings.Repeat("level/", limits.MaxPathDepth) + "tiny.txt"
-	fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{
-		CommitSHA: testCommitSHA,
-		Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(skillMarkdown("structural", "Structural limits.", "Body."))},
-			{Path: deepPath, Data: []byte("x")},
-		},
-	}}
-	set, err := LoadSetWithLimits(t.Context(), limits, NewGitHubSource(GitHubSourceConfig{
-		ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/structural", Fetcher: fetcher,
-	}))
-	if err == nil || set != nil || !errors.Is(err, ErrLimitExceeded) || len(fetcher.requests) != 1 {
-		t.Fatalf("set=%v error=%v requests=%d", set, err, len(fetcher.requests))
-	}
-}
-
-func TestGitHubSourceChecksEntryLimitBeforeRetainingInferredDirectories(t *testing.T) {
-	limits := DefaultLimits()
-	limits.MaxEntriesPerSkill = 2
-	limits.MaxPathDepth = 128
-	fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{
-		CommitSHA: testCommitSHA,
-		Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(skillMarkdown("entries", "Entry limits.", "Body."))},
-			{Path: "a/b/c/d/tiny.txt", Data: []byte("x")},
-		},
-	}}
-	set, err := LoadSetWithLimits(t.Context(), limits, NewGitHubSource(GitHubSourceConfig{
-		ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/entries", Fetcher: fetcher,
-	}))
-	if err == nil || set != nil || !errors.Is(err, ErrLimitExceeded) || len(fetcher.requests) != 1 {
-		t.Fatalf("set=%v error=%v requests=%d", set, err, len(fetcher.requests))
-	}
-}
-
-func TestGitHubSourceRejectsUnsafeOrIncompleteConfigurationBeforeFetching(t *testing.T) {
-	tests := []struct {
-		name   string
-		config GitHubSourceConfig
-		want   string
-	}{
-		{name: "empty repository", config: GitHubSourceConfig{ID: "github", Ref: "main", Path: "skills/a"}, want: "repository"},
-		{name: "URL", config: GitHubSourceConfig{ID: "github", Repository: "https://github.com/owner/repo", Ref: "main", Path: "skills/a"}, want: "owner/repository"},
-		{name: "credential URL", config: GitHubSourceConfig{ID: "github", Repository: "https://token-secret@github.com/owner/repo", Ref: "main", Path: "skills/a"}, want: "owner/repository"},
-		{name: "dot owner", config: GitHubSourceConfig{ID: "github", Repository: "../repo", Ref: "main", Path: "skills/a"}, want: "owner/repository"},
-		{name: "dot repository", config: GitHubSourceConfig{ID: "github", Repository: "owner/..", Ref: "main", Path: "skills/a"}, want: "owner/repository"},
-		{name: "current directory owner", config: GitHubSourceConfig{ID: "github", Repository: "./repo", Ref: "main", Path: "skills/a"}, want: "owner/repository"},
-		{name: "empty ref", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Path: "skills/a"}, want: "ref"},
-		{name: "invalid UTF-8 ref", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: string([]byte{'m', 0xff}), Path: "skills/a"}, want: "ref"},
-		{name: "dot dot ref", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "heads/../secret", Path: "skills/a"}, want: "ref"},
-		{name: "reflog ref", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main@{1}", Path: "skills/a"}, want: "ref"},
-		{name: "lock ref", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "refs/heads/main.lock", Path: "skills/a"}, want: "ref"},
-		{name: "empty path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main"}, want: "path"},
-		{name: "absolute path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "/skills/a"}, want: "relative"},
-		{name: "Windows absolute path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "C:/skills/a"}, want: "relative"},
-		{name: "traversal", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/../secret"}, want: ".."},
-		{name: "encoded traversal", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/%2e%2e/secret"}, want: "URL encoding"},
-		{name: "backslash traversal", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: `skills\..\secret`}, want: "backslash"},
-		{name: "newline path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/a\nsecret"}, want: "control"},
-		{name: "tab path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/a\tsecret"}, want: "control"},
-		{name: "invalid UTF-8 path", config: GitHubSourceConfig{ID: "github", Repository: "owner/repo", Ref: "main", Path: string([]byte{'s', 0xff})}, want: "UTF-8"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fetcher := &fakeGitHubFetcher{}
-			test.config.Fetcher = fetcher
-			set, err := LoadSet(t.Context(), NewGitHubSource(test.config))
-			if err == nil || set != nil || !strings.Contains(err.Error(), test.want) || len(fetcher.requests) != 0 {
-				t.Fatalf("set=%v error=%v requests=%d, want %q", set, err, len(fetcher.requests), test.want)
-			}
-			if strings.Contains(err.Error(), "token-secret") {
-				t.Fatalf("credential leaked in error: %v", err)
-			}
-		})
-	}
-}
-
-func TestGitHubSourceDoesNotRetryAndValidatesFetcherResult(t *testing.T) {
-	network := errors.New("network unavailable")
-	tests := []struct {
-		name   string
-		result GitHubFetchResult
-		err    error
-		want   string
-	}{
-		{name: "network error", err: network, want: "fetch failed"},
-		{name: "symbolic revision", result: GitHubFetchResult{CommitSHA: "main"}, want: "commit SHA"},
-		{name: "null SHA-1 revision", result: GitHubFetchResult{CommitSHA: strings.Repeat("0", 40)}, want: "commit SHA"},
-		{name: "null SHA-256 revision", result: GitHubFetchResult{CommitSHA: strings.Repeat("0", 64)}, want: "commit SHA"},
-		{name: "missing directory contents", result: GitHubFetchResult{CommitSHA: testCommitSHA}, want: "SKILL.md"},
-		{name: "oversized file", result: GitHubFetchResult{CommitSHA: testCommitSHA, Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(skillMarkdown("large", "Large skill.", "Body."))},
-			{Path: "asset.bin", Data: []byte(strings.Repeat("x", 1024*1024+1))},
-		}}, want: "file"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fetcher := &fakeGitHubFetcher{result: test.result, err: test.err}
-			set, err := LoadSet(t.Context(), NewGitHubSource(GitHubSourceConfig{
-				ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/a", Fetcher: fetcher,
-			}))
-			if err == nil || set != nil || !strings.Contains(err.Error(), test.want) || len(fetcher.requests) != 1 {
-				t.Fatalf("set=%v error=%v requests=%d, want %q", set, err, len(fetcher.requests), test.want)
-			}
-			if test.err != nil && errors.Is(err, test.err) {
-				t.Fatalf("error=%v exposes unsafe provider cause %v", err, test.err)
-			}
-		})
-	}
-}
-
-func TestGitHubSourceRedactsFetcherCredentialErrors(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		make func(*credentialBearingError) error
-	}{
-		{name: "direct", make: func(credential *credentialBearingError) error { return credential }},
-		{name: "wrapped EOF", make: func(credential *credentialBearingError) error { return &eofCredentialError{credential: credential} }},
-		{name: "joined EOF", make: func(credential *credentialBearingError) error { return errors.Join(io.EOF, credential) }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			credential := &credentialBearingError{message: "Authorization: Bearer token-secret"}
-			fetcher := &fakeGitHubFetcher{err: test.make(credential)}
-			set, err := LoadSet(t.Context(), NewGitHubSource(GitHubSourceConfig{
-				ID: "github", Repository: "owner/repo", Ref: "main", Path: "skills/a", Fetcher: fetcher,
-			}))
-			if err == nil || set != nil || len(fetcher.requests) != 1 || errors.Is(err, credential) || !errors.Is(err, ErrInvalidSource) {
-				t.Fatalf("set=%v error=%v requests=%d", set, err, len(fetcher.requests))
-			}
-			var exposed *credentialBearingError
-			if errors.As(err, &exposed) || strings.Contains(err.Error(), "token-secret") || strings.Contains(err.Error(), "Authorization") {
-				t.Fatalf("credential-bearing fetch error leaked: %v", err)
-			}
-		})
 	}
 }
 
@@ -618,23 +350,6 @@ func TestDescriptorRootPinsOpenedIntermediateDirectory(t *testing.T) {
 	if file, err := rooted.FS().Open("mounted/SKILL.md"); err == nil {
 		_ = file.Close()
 		t.Fatal("base traversal unexpectedly followed replacement symlink")
-	}
-}
-
-func TestGitHubSourceAppliesCallerLimitsBeforeBuildingSnapshot(t *testing.T) {
-	limits := DefaultLimits()
-	limits.MaxFileBytes = 32
-	fetcher := &fakeGitHubFetcher{result: GitHubFetchResult{
-		CommitSHA: testCommitSHA,
-		Files: []GitHubFile{
-			{Path: "SKILL.md", Data: []byte(skillMarkdown("limited", "Limited skill.", "Body."))},
-		},
-	}}
-	set, err := LoadSetWithLimits(t.Context(), limits, NewGitHubSource(GitHubSourceConfig{
-		ID: "github", Repository: "owner/repository", Ref: "main", Path: "skills/limited", Fetcher: fetcher,
-	}))
-	if err == nil || set != nil || !errors.Is(err, ErrLimitExceeded) || len(fetcher.requests) != 1 {
-		t.Fatalf("set=%v error=%v requests=%d", set, err, len(fetcher.requests))
 	}
 }
 

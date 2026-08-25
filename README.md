@@ -157,22 +157,16 @@ directories listed by the host. It never scans `~/.agents/skills`,
 `~/.codex/skills`, environment-derived locations, or the working directory.
 Local directories must be canonical absolute paths with no symbolic-link
 components; aliases are rejected instead of resolved. `LoadSet` closes
-filesystem resources after snapshotting. A host that calls a built-in source's
-public `Resolve` method directly must call `Close` on every returned
-`Artifact`.
+filesystem resources after snapshotting. A host that calls `LocalSource.Resolve`
+directly must call `Close` on every returned `Artifact`.
 
-GitHub access is also host-owned. `HTTPGitHubFetcher` is the bounded, read-only
-REST implementation; a host may instead inject its own `GitHubFetcher`. Both
-resolve the configured ref to a commit SHA and return copied `GitHubFile`
-records rooted at the requested Skill directory. The source rejects non-regular entry modes,
-validates path collisions and limits, and deep-copies all bytes before parsing;
-an arbitrary host filesystem is never retained as a confinement boundary.
-`GitHubFile.Mode` uses Go's `io/fs.FileMode` permission bits, not raw Git tree
-modes. Local filesystem sources require descriptor-relative, no-follow path
-primitives and fail explicitly on unsupported targets.
-Default limits also cap each Skill at 16,384 total filesystem entries, 4,096
-bytes per relative path, and 64 path components so empty-directory or deep-path
-structures cannot bypass the file and byte limits.
+The runtime does not fetch Skills from GitHub or other remotes. A host that
+needs remote content must snapshot it into a local directory (or implement a
+trusted custom `skills.Source`) before `LoadSet`. Local filesystem loading
+requires descriptor-relative, no-follow path primitives and fails explicitly on
+unsupported targets. Default limits also cap each Skill at 16,384 total
+filesystem entries, 4,096 bytes per relative path, and 64 path components so
+empty-directory or deep-path structures cannot bypass the file and byte limits.
 
 ```go
 skillSet, err := skills.LoadSet(ctx,
@@ -183,15 +177,6 @@ skillSet, err := skills.LoadSet(ctx,
 			"/opt/agent-skills/code-review",
 			"/opt/agent-skills/release-notes",
 		},
-	}),
-	// githubFetcher may be created with skills.NewHTTPGitHubFetcher. It never
-	// retries or sleeps; the host owns credentials and backoff policy.
-	skills.NewGitHubSource(skills.GitHubSourceConfig{
-		ID:         "github",
-		Repository: "owner/repository",
-		Ref:        "v1.2.0",
-		Path:       "skills/security-review",
-		Fetcher:    githubFetcher,
 	}),
 )
 if err != nil {

@@ -210,17 +210,6 @@ func fileData(t *testing.T, skill Skill, wanted string) []byte {
 	return nil
 }
 
-type fakeGitHubFetcher struct {
-	requests []GitHubFetchRequest
-	result   GitHubFetchResult
-	err      error
-}
-
-func (fetcher *fakeGitHubFetcher) Fetch(_ context.Context, request GitHubFetchRequest) (GitHubFetchResult, error) {
-	fetcher.requests = append(fetcher.requests, request)
-	return fetcher.result, fetcher.err
-}
-
 func artifactWithFS(sourceID, locator, revision string, filesystem fs.FS) Artifact {
 	return Artifact{SourceID: sourceID, Locator: locator, Revision: revision, FS: filesystem}
 }

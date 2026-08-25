@@ -29,6 +29,8 @@ runtime contract.
 - Remote MCP discovery and execution are not implemented.
 - There is no Codex Plugin runtime; Skills are explicit immutable instruction
   snapshots and supporting files are inert.
+- Remote Skill fetch, including GitHub, is not implemented. The built-in source
+  loads only explicit local directories.
 - v0.1.0 does not include a public store conformance package. Current `main`
   includes a process-local reference implementation, not a durable database
   adapter.
