@@ -21,6 +21,12 @@ include explicit compatibility guidance.
 
 ### Changed
 
+- Terminal run events (`run_completed`, `run_waiting_user`, `run_failed`,
+  `run_interrupted`, `run_cancelled`) are delivered after the session lease
+  stops, and lease-renewal events are delivered on a dedicated path, so a
+  blocking event observer can no longer stall lease renewal or keep a lease
+  alive past a finished run. At most one renewal event may still be in flight
+  after a run returns.
 - Failed, interrupted, and cancelled runs atomically commit their error audit
   item or explicitly record `audit_missing`.
 - OpenAI semantic validation is split by protocol domain and protected by a

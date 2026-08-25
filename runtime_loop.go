@@ -159,6 +159,9 @@ type leaseGuard struct {
 	cancelGrace     time.Duration
 	finalizeGrace   time.Duration
 	onRenew         func(RunHandle)
+	// renewEvents carries renewal notifications to a dedicated delivery worker
+	// so a blocking event observer can never stall the renewal loop itself.
+	renewEvents chan RunHandle
 }
 
 func newLeaseGuard(store RunStore, handle RunHandle, ttl, renewalInterval, cancelGrace time.Duration) *leaseGuard {
@@ -220,6 +223,8 @@ func (guard *leaseGuard) Start(ctx context.Context) (context.Context, func(), fu
 	graceDone := guard.startCancellationGrace(runCtx, cancelRenew, refreshGrace, stopGrace)
 	done := make(chan struct{})
 	failure := make(chan error, 1)
+	guard.renewEvents = make(chan RunHandle, 1)
+	go guard.deliverRenewalEvents(guard.renewEvents)
 	go guard.renewLoop(renewCtx, cancelRun, done, failure)
 	prepareFinalization := func() {
 		refreshLeaseGrace(refreshGrace, graceDone, guard.finalizeGrace)
@@ -316,7 +321,12 @@ func (guard *leaseGuard) renewLease(ctx context.Context) error {
 		return fmt.Errorf("%w: renew session %s: %w", ErrSessionLeaseLost, handle.SessionID, err)
 	}
 	if guard.onRenew != nil {
-		guard.onRenew(guard.Handle())
+		select {
+		case guard.renewEvents <- guard.Handle():
+		default:
+			// A previous delivery is still in flight. The buffered entry already
+			// carries the latest handle, so this observation is redundant.
+		}
 	}
 	return nil
 }
@@ -358,8 +368,25 @@ func (guard *leaseGuard) renewalStopper(
 			default:
 			}
 			cancelRun(nil)
+			close(guard.renewEvents)
 		})
 		return renewalErr
+	}
+}
+
+// deliverRenewalEvents observes renewal notifications in order without ever
+// running on the renewal loop's liveness path. A permanently blocked observer
+// strands this goroutine, never the lease.
+//
+// Stopping the guard does not wait for this worker, so at most one renewal
+// event may still be in flight after the run returns. Hosts must not tear down
+// their event sink until no Run is outstanding or they tolerate a trailing
+// delivery.
+func (guard *leaseGuard) deliverRenewalEvents(events <-chan RunHandle) {
+	for handle := range events {
+		if guard.onRenew != nil {
+			guard.onRenew(handle)
+		}
 	}
 }
 

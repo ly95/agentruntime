@@ -573,20 +573,26 @@ func (active *activeRunLease) fail(cause error) error {
 	if errors.Is(runCause, ErrSessionLeaseLost) && !errors.Is(cause, ErrSessionLeaseLost) {
 		cause = errors.Join(runCause, cause)
 	}
-	failure := active.runtime.failRun(active.baseContext, *active.run, active.state, cause)
+	trailing, failure := active.runtime.failRun(active.baseContext, *active.run, active.state, cause)
+	// Stop the lease before any observer delivery: a blocked event sink must
+	// not keep the renewal loop or the lease alive past a failed run.
 	active.stop()
+	active.runtime.emit(trailing)
 	return failure
 }
 
 func (active *activeRunLease) wait() (*Result, error) {
 	active.prepareFinalization()
-	result, err := active.runtime.waitRun(
+	result, trailing, err := active.runtime.waitRun(
 		active.baseContext, *active.run, active.state,
 	)
 	if err != nil {
 		return nil, active.fail(err)
 	}
+	// Deliver the waiting-user event after the lease stops for the same reason:
+	// a blocked observer must not keep renewing the lease on a paused run.
 	active.stop()
+	active.runtime.emit(trailing)
 	return result, nil
 }
 
@@ -666,12 +672,13 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 		return nil, active.fail(runCause)
 	}
 	active.prepareFinalization()
-	result, err := r.completeRun(ctx, run, state, out)
+	result, trailing, err := r.completeRun(ctx, run, state, out)
 	if err != nil {
 		stableState.restore(state, &run)
 		return nil, active.fail(err)
 	}
 	active.stop()
+	r.emit(trailing)
 	return result, nil
 }
 

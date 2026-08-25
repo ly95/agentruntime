@@ -536,7 +536,7 @@ func (r *Runtime) appendItem(ctx context.Context, item ItemRecord) error {
 	return validateUTF8Error("run store", r.runStore.AppendItem(ctx, item))
 }
 
-func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentState, output string) (*Result, error) {
+func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentState, output string) (*Result, Event, error) {
 	run.Status = RunStatusCompleted
 	run.PendingApprovalDigest = ""
 	run.Result = output
@@ -545,32 +545,34 @@ func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentSt
 		if state.sessionID != "" {
 			projected, err := projectTerminalSessionTranscript(state.transcript, run.Artifacts)
 			if err != nil {
-				return nil, fmt.Errorf("agent: project terminal session history: %w", err)
+				return nil, Event{}, fmt.Errorf("agent: project terminal session history: %w", err)
 			}
 			state.transcript = projected
 		}
 		session := r.sessionForRun(state, run.ID, nil)
 		storedRun, err := clonePersistentRunRecord(run)
 		if err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 		request := FinishRunRequest{Handle: state.lease.Handle(), Run: storedRun, Session: session}
 		if err := request.Validate(); err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 		if err := r.runStore.FinishRun(ctx, request); err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 	}
-	r.emit(Event{Type: EventRunCompleted, RunID: run.ID, SessionID: run.SessionID, ResponseID: state.lastResponseID, Text: output})
+	// The completion event trails the caller so it can be emitted after the
+	// lease is stopped: a blocked observer must not keep a lease alive.
+	trailing := Event{Type: EventRunCompleted, RunID: run.ID, SessionID: run.SessionID, ResponseID: state.lastResponseID, Text: output}
 	return &Result{
 		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
 		LastResponseID: state.lastResponseID, Output: output,
 		Artifacts: publicResultArtifacts(run.Artifacts),
-	}, nil
+	}, trailing, nil
 }
 
-func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState) (*Result, error) {
+func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState) (*Result, Event, error) {
 	pending := pendingApprovalSummary(state)
 	run.Status = RunStatusWaitingUser
 	if state.pendingApproval != nil {
@@ -589,17 +591,17 @@ func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState)
 		}
 		storedRun, err := clonePersistentRunRecord(run)
 		if err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 		request := FinishRunRequest{
 			Handle: state.lease.Handle(), Run: storedRun, Session: session,
 			PendingApproval: state.pendingApproval,
 		}
 		if err := request.Validate(); err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 		if err := r.runStore.FinishRun(ctx, request); err != nil {
-			return nil, err
+			return nil, Event{}, err
 		}
 		state.pendingApproval = nil
 	}
@@ -611,12 +613,11 @@ func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState)
 		event.Text = pending.Reason
 		event.ApprovalPreview = append(json.RawMessage(nil), pending.Preview...)
 	}
-	r.emit(event)
 	return &Result{
 		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
 		PendingApprovalDigest: run.PendingApprovalDigest,
 		PendingApproval:       clonePendingApprovalSummary(pending),
-	}, nil
+	}, event, nil
 }
 
 func pendingApprovalSummary(state *agentState) *PendingApprovalSummary {
@@ -652,7 +653,7 @@ func clonePendingApprovalSummary(summary *PendingApprovalSummary) *PendingApprov
 	return &out
 }
 
-func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState, cause error) error {
+func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState, cause error) (Event, error) {
 	cause = validateUTF8Error("runtime dependency", cause)
 	run.PendingApprovalDigest = ""
 	eventType := EventRunFailed
@@ -726,8 +727,8 @@ func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState,
 			cause = errors.Join(cause, err)
 		}
 	}
-	r.emit(Event{Type: eventType, RunID: run.ID, SessionID: run.SessionID, ModelCallID: modelCallID, CallID: callID, ExecutionID: executionID, AttemptID: attemptID, ErrorCode: run.ErrorCode, Error: cause.Error()})
-	return cause
+	trailing := Event{Type: eventType, RunID: run.ID, SessionID: run.SessionID, ModelCallID: modelCallID, CallID: callID, ExecutionID: executionID, AttemptID: attemptID, ErrorCode: run.ErrorCode, Error: cause.Error()}
+	return trailing, cause
 }
 
 func (r *Runtime) detachedCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {

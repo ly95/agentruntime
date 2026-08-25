@@ -127,6 +127,122 @@ func TestRuntimeRenewsSessionLeaseWhileModelIsRunning(t *testing.T) {
 	}
 }
 
+// A blocked event observer must not stall lease renewal: the renewal event is
+// delivered on a dedicated path, so a stuck sink cannot cost the run its lease.
+func TestLeaseRenewalSurvivesBlockedEventObserver(t *testing.T) {
+	store := NewInMemoryStore()
+	release := make(chan struct{})
+	releaseSink := make(chan struct{})
+	firstRenewal := make(chan struct{}, 1)
+	rt, err := NewRuntime(RuntimeConfig{
+		Model: blockingModel{release: release}, RunStore: store,
+		SessionLeaseTTL: 100 * time.Millisecond, LeaseRenewalInterval: 5 * time.Millisecond,
+		EventSink: func(event Event) {
+			if event.Type != EventSessionLeaseRenewed {
+				return
+			}
+			select {
+			case firstRenewal <- struct{}{}:
+			default:
+			}
+			<-releaseSink
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	type runResult struct {
+		result *Result
+		err    error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		result, runErr := rt.Run(context.Background(), Input{User: "wait", SessionID: "session-renew-blocked"})
+		done <- runResult{result: result, err: runErr}
+	}()
+	select {
+	case <-firstRenewal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first renewal event was not delivered")
+	}
+	// Let several lease TTLs elapse while the observer stays blocked. If the
+	// renewal loop were coupled to event delivery, the lease would expire and
+	// the run would fail before the model is released.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	select {
+	case got := <-done:
+		if got.err != nil || got.result == nil || got.result.Output != "done" {
+			t.Fatalf("Run result=%+v err=%v, want completion despite blocked observer", got.result, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not finish after model release")
+	}
+	if _, leased := store.leases["session-renew-blocked"]; leased {
+		t.Fatal("completed run retained its session lease")
+	}
+	close(releaseSink)
+}
+
+// A blocked observer at the final failure event must not keep the lease alive:
+// the lease stops before the trailing event is delivered.
+func TestRunFailureStopsLeaseBeforeFinalEventDelivery(t *testing.T) {
+	store := NewInMemoryStore()
+	entered := make(chan struct{})
+	releaseSink := make(chan struct{})
+	rt, err := NewRuntime(RuntimeConfig{
+		Model:    errorModel{err: errors.New("boom")},
+		RunStore: store,
+		EventSink: func(event Event) {
+			if event.Type == EventRunFailed {
+				close(entered)
+				<-releaseSink
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := rt.Run(context.Background(), Input{User: "fail", SessionID: "session-final-event"})
+		done <- runErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("final failure event was not delivered")
+	}
+	if _, leased := store.leases["session-final-event"]; leased {
+		t.Fatal("failed run retained its lease while final event delivery was blocked")
+	}
+	if len(store.runs) != 1 {
+		t.Fatalf("stored run count=%d, want 1", len(store.runs))
+	}
+	for _, run := range store.runs {
+		if run.Status != RunStatusFailed {
+			t.Fatalf("stored run status=%q, want failed", run.Status)
+		}
+	}
+	close(releaseSink)
+	select {
+	case runErr := <-done:
+		if runErr == nil {
+			t.Fatal("Run succeeded, want error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after final event delivery was released")
+	}
+}
+
+type errorModel struct {
+	err error
+}
+
+func (m errorModel) Complete(context.Context, ModelRequest) (*ModelResponse, error) {
+	return nil, m.err
+}
+
 func TestLeaseRenewalStopsAfterCancellationGrace(t *testing.T) {
 	store := &graceBlockingRenewStore{
 		firstRenewed:   make(chan struct{}),

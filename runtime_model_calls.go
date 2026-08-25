@@ -114,6 +114,10 @@ func (r *Runtime) resumeApprovedOperation(ctx context.Context, run *RunRecord, i
 		}
 		return append(transcript, ModelInputItem{Type: ModelInputToolResult, CallID: operation.call.ID, Output: result}), "", nil
 	}
+	// The resumed ApprovalResume is the approval evidence for this operation, so
+	// a fresh policy decision that still asks for approval (PolicyRequireApproval)
+	// is already satisfied; only a new Deny overrides it. Marking the decision
+	// Allow here skips re-requesting an approver during execution.
 	operation.policyDecision = PolicyDecision{Action: PolicyAllow}
 	result, err := r.executeOperation(ctx, run, input, state, operation)
 	if err != nil {
