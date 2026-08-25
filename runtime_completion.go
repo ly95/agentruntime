@@ -554,7 +554,11 @@ func (r *Runtime) completeRun(ctx context.Context, run RunRecord, state *agentSt
 		}
 	}
 	r.emit(Event{Type: EventRunCompleted, RunID: run.ID, SessionID: run.SessionID, ResponseID: state.lastResponseID, Text: output})
-	return &Result{RunID: run.ID, SessionID: run.SessionID, Status: run.Status, LastResponseID: state.lastResponseID, Output: output}, nil
+	return &Result{
+		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
+		LastResponseID: state.lastResponseID, Output: output,
+		Artifacts: cloneResultArtifacts(run.Artifacts),
+	}, nil
 }
 
 func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState) (*Result, error) {
@@ -586,7 +590,10 @@ func (r *Runtime) waitRun(ctx context.Context, run RunRecord, state *agentState)
 		state.pendingApproval = nil
 	}
 	r.emit(Event{Type: EventRunWaitingUser, RunID: run.ID, SessionID: run.SessionID})
-	return &Result{RunID: run.ID, SessionID: run.SessionID, Status: run.Status}, nil
+	return &Result{
+		RunID: run.ID, SessionID: run.SessionID, Status: run.Status,
+		PendingApprovalDigest: run.PendingApprovalDigest,
+	}, nil
 }
 
 func (r *Runtime) failRun(ctx context.Context, run RunRecord, state *agentState, cause error) error {

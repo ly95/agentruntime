@@ -7,20 +7,18 @@
 > **Status:** `agentruntime` is pre-1.0. The public API may change between minor
 > versions while the runtime contracts are refined.
 
-`agentruntime` is an embeddable Go runtime for agents built on the OpenAI Responses
-API. It owns the model/tool loop while the host application keeps control of
-authorization, approvals, persistence, side effects, verification, and domain
-behavior through explicit interfaces.
+`agentruntime` is an embeddable Go **kernel** for agents built on the OpenAI
+Responses API. It owns the model/tool loop. The host keeps authorization,
+approvals, persistence, side effects, verification, and domain behavior.
 
-The project is intended for applications that need production-oriented tool
-execution semantics without adopting an HTTP server, database, queue, UI, or
-product framework from the runtime.
+This is not an agent platform, remote MCP client, Codex plugin runtime, or
+product framework. It has no HTTP server, database, queue, UI, billing, or
+built-in domain tools.
 
 ## Why agentruntime
 
-- Embed a complete streaming model/tool loop in an existing Go application.
-- Expose JSON Schema-validated operation contracts to the model through an
-  in-process MCP server.
+- Embed a streaming model/tool loop in an existing Go application.
+- Offer JSON Schema-validated operation contracts to the model as function tools.
 - Keep policy, human approval, execution, and independent verification under
   host control.
 - Resume approvals and stateful conversations without giving the model
@@ -30,18 +28,14 @@ product framework from the runtime.
 - Observe the runtime through structured events without coupling it to an
   application transport or storage implementation.
 
-`agentruntime` deliberately does not provide application handlers, database
-implementations, queue workers, built-in domain tools, billing rules, product
-prompts, or a remote MCP client.
-
 ## Architecture and trust boundaries
 
 ```mermaid
 flowchart LR
     Host["Host application"] --> Runtime["agentruntime"]
     Runtime <--> Model["OpenAI Responses API"]
-    Runtime --> MCP["In-process MCP tool catalog"]
-    MCP --> Policy["Host policy"]
+    Runtime --> Registry["OperationRegistry"]
+    Registry --> Policy["Host policy"]
     Policy -->|allow| Execute["Host executor"]
     Policy -->|require approval| Approve["Host approval"]
     Approve --> Execute
@@ -51,7 +45,7 @@ flowchart LR
     Executions --> Reconcile["OperationReconciler"]
 ```
 
-MCP discovery only exposes operation contracts to the model; it never grants
+Registering an operation only exposes a contract to the model; it never grants
 permission. Every operation is evaluated by host policy before execution. A
 confirmation-required write cannot complete successfully without a positive
 verifier result carrying non-empty, non-`null`, unambiguous JSON evidence. The
@@ -61,7 +55,7 @@ transition acknowledgements, and reconciliation.
 | Runtime owns | Host application owns |
 | --- | --- |
 | Model iteration and OpenAI event mapping | API keys, model selection, and product instructions |
-| In-process MCP discovery and JSON Schema validation | Authorization and capability policy |
+| Operation contracts and JSON Schema validation | Authorization and capability policy |
 | Approval pause/resume orchestration | Approval UI and approval decisions |
 | Transcript, lease, plan, and execution state transitions | Durable `RunStore` and `ExecutionStore` implementations |
 | Verification and reconciliation orchestration | Side effects, receipts, verification logic, and reconciliation decisions |
@@ -159,10 +153,10 @@ first-run failure and abandoned-lease recovery.
 Local loading is explicit-only: `NewLocalSource` reads exactly the absolute
 directories listed by the host. It never scans `~/.agents/skills`,
 `~/.codex/skills`, environment-derived locations, or the working directory.
-Local and Codex Plugin directories must be canonical absolute paths with no
-symbolic-link components; aliases are rejected instead of resolved. `LoadSet`
-closes filesystem resources after snapshotting. A host that calls a built-in
-source's public `Resolve` method directly must call `Close` on every returned
+Local directories must be canonical absolute paths with no symbolic-link
+components; aliases are rejected instead of resolved. `LoadSet` closes
+filesystem resources after snapshotting. A host that calls a built-in source's
+public `Resolve` method directly must call `Close` on every returned
 `Artifact`.
 
 GitHub access is also host-owned: an injected `GitHubFetcher` resolves the
@@ -171,8 +165,8 @@ the requested Skill directory. The source rejects non-regular entry modes,
 validates path collisions and limits, and deep-copies all bytes before parsing;
 an arbitrary host filesystem is never retained as a confinement boundary.
 `GitHubFile.Mode` uses Go's `io/fs.FileMode` permission bits, not raw Git tree
-modes. Local and Codex Plugin filesystem sources require descriptor-relative,
-no-follow path primitives and fail explicitly on unsupported targets.
+modes. Local filesystem sources require descriptor-relative, no-follow path
+primitives and fail explicitly on unsupported targets.
 Default limits also cap each Skill at 16,384 total filesystem entries, 4,096
 bytes per relative path, and 64 path components so empty-directory or deep-path
 structures cannot bypass the file and byte limits.
@@ -196,12 +190,6 @@ skillSet, err := skills.LoadSet(ctx,
 		Path:       "skills/security-review",
 		Fetcher:    githubFetcher,
 	}),
-	// Plugin directories are explicit installations. The source reads
-	// .codex-plugin/plugin.json and imports Skill directories under its skills path.
-	skills.NewCodexPluginSource(skills.CodexPluginSourceConfig{
-		ID:                "codex-installed",
-		PluginDirectories: []string{"/opt/codex-plugins/notion"},
-	}),
 )
 if err != nil {
 	return err
@@ -213,11 +201,9 @@ runtime, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{
 })
 ```
 
-Supporting files such as `references/`, `assets/`, `meta.yaml`, and
-`agents/openai.yaml` are preserved in the snapshot and covered by its digest,
-but this MVP injects only `SKILL.md`. It never executes `scripts/`, loads hooks,
-starts Plugin MCP servers, interprets `.app.json`, or implements the rest of the
-Codex Plugin runtime.
+Supporting files such as `references/`, `assets/`, and `meta.yaml` are preserved
+in the snapshot and covered by its digest, but the runtime injects only
+`SKILL.md`. It never executes `scripts/` or treats Skill files as tools.
 
 ## Operation requirements
 
@@ -277,7 +263,7 @@ Runnable examples live in [`examples`](examples/README.md):
 | Example | Demonstrates |
 | --- | --- |
 | [`basic`](examples/basic/main.go) | A stateless agent without tools |
-| [`mcp`](examples/mcp/main.go) | A read-only operation exposed through the runtime's in-process MCP server |
+| [`operations`](examples/operations/main.go) | A read-only host operation offered to the model as a function tool |
 | [`skill`](examples/skill/main.go) | An explicitly loaded local `SKILL.md` mounted beside a host-owned operation |
 
 The examples intentionally keep their side effects read-only. Production write
@@ -290,8 +276,6 @@ described above.
   endpoints, middleware, timeouts, and bounded pre-stream retries are configured
   on the injected `openai.Client`; compatibility with non-OpenAI implementations
   is not guaranteed.
-- MCP support is currently an in-process operation-discovery boundary, not a
-  client for arbitrary remote MCP servers.
 - Invalid configuration, unsupported provider output, missing resources, and
   ambiguous execution outcomes fail explicitly.
 - The runtime does not retry semantic model turns or side-effecting operations,

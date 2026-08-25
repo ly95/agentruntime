@@ -8,9 +8,9 @@ billing rules, product prompts, or domain tools.
 
 ## Design
 
-- Keep the model loop, operation contracts, MCP integration, approvals,
-  persistence ports, reconciliation, context management, and provider
-  transports independent of any host application.
+- Keep the model loop, operation contracts, approvals, persistence ports,
+  reconciliation, context management, and provider transports independent of
+  any host application.
 - Host-owned behavior enters only through explicit interfaces and immutable
   constructor configuration.
 - Fail explicitly on invalid configuration, unsupported provider output,

@@ -7,8 +7,8 @@ contracts.
 ## Project boundary
 
 This repository owns the Go agent runtime: the model loop, operation contracts,
-in-process MCP integration, approvals, persistence ports, reconciliation,
-context management, and provider transports.
+approvals, persistence ports, reconciliation, context management, and provider
+transports.
 
 Application handlers, database implementations, queue workers, billing rules,
 product prompts, and domain-specific tools belong in host applications. Please

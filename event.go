@@ -13,7 +13,6 @@ const (
 	EventContextCompactionStarted   EventType = "context_compaction_started"
 	EventContextCompactionCompleted EventType = "context_compaction_completed"
 	EventContextCompactionFailed    EventType = "context_compaction_failed"
-	EventMCPConnected               EventType = "mcp_connected"
 	EventOperationPlanReserved      EventType = "operation_plan_reserved"
 	EventOperationPlanRejected      EventType = "operation_plan_rejected"
 	EventOperationPlanSealed        EventType = "operation_plan_sealed"
@@ -39,10 +38,6 @@ type Event struct {
 	Type            EventType         `json:"type"`
 	RunID           string            `json:"run_id"`
 	SessionID       string            `json:"session_id,omitempty"`
-	MCPServer       string            `json:"mcp_server,omitempty"`
-	MCPVersion      string            `json:"mcp_version,omitempty"`
-	MCPProtocol     string            `json:"mcp_protocol,omitempty"`
-	MCPToolCount    int               `json:"mcp_tool_count,omitempty"`
 	Operation       string            `json:"operation,omitempty"`
 	ModelCallID     string            `json:"model_call_id,omitempty"`
 	RequestID       string            `json:"request_id,omitempty"`

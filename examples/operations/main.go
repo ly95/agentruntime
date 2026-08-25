@@ -36,7 +36,7 @@ func run() error {
 	agent, err := agentruntime.NewRuntime(agentruntime.RuntimeConfig{
 		Model:      model,
 		Operations: operations,
-		MCPInstructions: "For every addition request, call math_add. " +
+		Instructions: "For every addition request, call math_add. " +
 			"Do not calculate the sum yourself.",
 		Policy:    agentruntime.OperationPolicyFunc(allowReadOperations),
 		Executor:  agentruntime.OperationExecutorFunc(executeMath),
@@ -137,8 +137,6 @@ func integerArgument(arguments map[string]any, name string) (int64, error) {
 
 func logToolEvents(event agentruntime.Event) {
 	switch event.Type {
-	case agentruntime.EventMCPConnected:
-		fmt.Fprintf(os.Stderr, "MCP connected: %s (%d tool)\n", event.MCPServer, event.MCPToolCount)
 	case agentruntime.EventOperationStarted:
 		fmt.Fprintf(os.Stderr, "tool started: %s\n", event.Operation)
 	case agentruntime.EventOperationCompleted:

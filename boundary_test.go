@@ -12,9 +12,7 @@ import (
 func TestPackageDoesNotImportHostApplications(t *testing.T) {
 	allowedPrefixes := []string{
 		"github.com/ly95/agentruntime",
-		"github.com/modelcontextprotocol/go-sdk",
 		"github.com/openai/openai-go/v3",
-		"github.com/samber/lo",
 		"github.com/santhosh-tekuri/jsonschema/v6",
 	}
 	entries, err := os.ReadDir(".")

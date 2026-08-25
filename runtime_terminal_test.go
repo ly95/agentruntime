@@ -220,8 +220,14 @@ func TestRuntimeCarriesTerminalOperationArtifactsToRunStore(t *testing.T) {
 	rt := newTestRuntimeWithEventSink(t, model, ops, allowPolicy(), executor, nil, nil, store, func(event Event) {
 		events = append(events, event)
 	})
-	if _, err := rt.Run(context.Background(), Input{User: "finish", SessionID: "artifact-session"}); err != nil {
+	result, err := rt.Run(context.Background(), Input{User: "finish", SessionID: "artifact-session"})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Type != "image_result" ||
+		string(result.Artifacts[0].Data) != `{"generation_id":"exec-1"}` ||
+		string(result.Artifacts[0].InternalData) != `{"storage_key":"private/change-set-plan"}` {
+		t.Fatalf("result artifacts=%+v", result.Artifacts)
 	}
 	if len(store.completed) != 1 || len(store.completed[0].Artifacts) != 1 || store.completed[0].Artifacts[0].Type != "image_result" {
 		t.Fatalf("completed runs=%+v", store.completed)

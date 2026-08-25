@@ -456,6 +456,12 @@ func (f ApproverFunc) RequestApproval(ctx context.Context, req ApprovalRequest) 
 	return f(ctx, req)
 }
 
+type ApprovalResumerFunc func(ctx context.Context, runID string) (*ApprovalResume, error)
+
+func (f ApprovalResumerFunc) ResumeApproval(ctx context.Context, runID string) (*ApprovalResume, error) {
+	return f(ctx, runID)
+}
+
 func normalizeNames(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))

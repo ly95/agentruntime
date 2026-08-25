@@ -13,7 +13,6 @@ func TestFilesystemSourcesFailExplicitlyOnUnsupportedTarget(t *testing.T) {
 	directory := testTempDir(t)
 	for _, source := range []Source{
 		NewLocalSource(LocalSourceConfig{ID: "local", Directories: []string{directory}}),
-		NewCodexPluginSource(CodexPluginSourceConfig{ID: "codex", PluginDirectories: []string{directory}}),
 	} {
 		set, err := LoadSet(t.Context(), source)
 		if err == nil || set != nil || !errors.Is(err, ErrInvalidSource) ||
