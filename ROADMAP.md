@@ -9,18 +9,18 @@ runtime contract rather than a platform-shaped placeholder.
 - **Reference store conformance:** define reusable `RunStore` and
   `ExecutionStore` conformance tests plus a process-local reference
   implementation. See
-  [ADR 0001](docs/adr/0001-store-adapter-conformance.md). Tracking issue will
-  be linked after publication.
+  [ADR 0001](docs/adr/0001-store-adapter-conformance.md) and
+  [tracking issue #3](https://github.com/ly95/agentruntime/issues/3).
 - **Remote MCP boundary:** decide whether a remote MCP adapter can be mapped
   into immutable `OperationRegistry` contracts without acquiring execution
   authority or silently refreshing schemas. See
-  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md). Tracking issue
-  will be linked after publication.
+  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md) and
+  [tracking issue #4](https://github.com/ly95/agentruntime/issues/4).
 - **Additional model providers:** specify the validation, lifecycle corpus,
   stable error mapping, and immutable run binding required of another `Model`
   adapter. See
-  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md). Tracking issue
-  will be linked after publication.
+  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md) and
+  [tracking issue #5](https://github.com/ly95/agentruntime/issues/5).
 
 ## Known limits
 
