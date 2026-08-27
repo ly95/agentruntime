@@ -18,6 +18,10 @@ include explicit compatibility guidance.
   reconciliation events, and provider token usage fields.
 - Immutable Skill resources and an offline approval, retry, and reconciliation
   example.
+- Atomic `OperationRegistry.RegisterAll` registration and a constrained
+  `mcpadapter` for bounded MCP `2026-07-28` discovery of host-allowlisted,
+  synchronous read tools with immutable binding/schema digests and structured
+  result validation.
 
 ### Changed
 
@@ -47,6 +51,14 @@ include explicit compatibility guidance.
 
 - Added approval UI and log guidance, redaction helpers, strict provider
   authority validation, and immutable resource access rules.
+- Remote MCP reads keep transport credentials and SSRF policy host-owned and
+  strip untrusted schema annotation text before model exposure. Generated
+  operations require explicit host read-only attestation and reject a
+  contradictory negative server hint. The adapter rejects hot schema replacement,
+  non-local references, MRTR, malformed header annotations, binding drift,
+  configured snapshot-pin mismatch, and raw server/transport-error disclosure.
+  Injected transports are contractually responsible for atomic binding checks,
+  bounded reads, cancellation, and no transparent retry.
 
 ## [0.1.0] - 2026-08-25
 

@@ -6,19 +6,25 @@ runtime contract.
 
 ## Adoption roadmap
 
-- **Reference store conformance:** current `main` includes exported `RunStore`
-  and `ExecutionStore` conformance suites plus a process-local reference
-  implementation. See [ADR 0001](docs/adr/0001-store-adapter-conformance.md),
+- **Reference store conformance — implemented:** current `main` includes exported
+  `RunStore` and `ExecutionStore` conformance suites plus a process-local
+  reference implementation. See [ADR 0001](docs/adr/0001-store-adapter-conformance.md),
   the [store adapter guide](docs/store-adapter-guide.md), and
   [tracking issue #3](https://github.com/ly95/agentruntime/issues/3).
-- **Remote MCP boundary:** decide whether a remote MCP adapter can be mapped
-  into immutable `OperationRegistry` contracts without acquiring execution
-  authority or silently refreshing schemas. See
-  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md) and
+- **Constrained remote MCP reads — implemented:** `mcpadapter` performs bounded
+  startup discovery against MCP `2026-07-28`, freezes exact host-allowlisted
+  read-only tools into immutable operations for execution through Runtime's
+  existing policy/executor path. Direct `Snapshot.Execute` calls bypass that
+  policy just like direct calls to any executor. Network transport, streaming
+  limits, credentials, SSRF controls, snapshot deployment pins, and read-only
+  attestation remain host-owned. See
+  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md), the
+  [adapter guide](docs/mcp-adapter-guide.md), and
   [tracking issue #4](https://github.com/ly95/agentruntime/issues/4).
-- **Additional model providers:** specify the validation, lifecycle corpus,
-  stable error mapping, and immutable run binding required of another `Model`
-  adapter. See
+- **Additional model provider readiness — next design gate:** freeze the adapter
+  contract, durable provider binding, lifecycle/error/usage/cancellation rules,
+  and provider-neutral positive and negative conformance corpus before choosing
+  or implementing a second provider. See
   [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md), the
   [provider compatibility guide](docs/provider-compatibility.md), and
   [tracking issue #5](https://github.com/ly95/agentruntime/issues/5).
@@ -26,7 +32,12 @@ runtime contract.
 ## Known limits
 
 - OpenAI Responses is the only bundled model adapter.
-- Remote MCP discovery and execution are not implemented.
+- `mcpadapter` supports only startup-frozen, synchronous, structured read tools.
+  It does not persist snapshots, migrate durable catalogs, bundle
+  HTTP/SSE/OAuth, execute remote writes, hot-refresh, subscribe, follow
+  multi-round-trip input, run asynchronous tasks, perform adapter-level retries,
+  or fall back. Host transports must enforce binding, read limits, and no-retry
+  behavior at dispatch.
 - There is no Codex Plugin runtime; Skills are explicit immutable instruction
   snapshots and supporting files are inert.
 - Remote Skill fetch, including GitHub, is not implemented. The built-in source

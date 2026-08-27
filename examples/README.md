@@ -12,9 +12,9 @@ These examples are small, runnable programs that exercise the public
 
 ## Configure
 
-The `basic`, `mcp`, and `skill` examples use the OpenAI Responses API and fail
-explicitly when required configuration is missing. The `approval` example is
-fully offline.
+The `basic`, `operations`, and `skill` examples use the OpenAI Responses API and
+fail explicitly when required configuration is missing. The `approval` example
+is fully offline.
 
 ```bash
 export OPENAI_API_KEY="..."

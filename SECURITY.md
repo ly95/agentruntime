@@ -43,6 +43,8 @@ Reports are especially useful when they involve:
 - stale session or execution ownership;
 - transcript, attachment, artifact, or trusted-context disclosure;
 - JSON Schema validation or provider-output confusion;
+- MCP transport-binding, schema-snapshot, metadata-header, or read-only
+  authority confusion;
 - incorrect reconciliation of an ambiguous operation result.
 
 Host application policies, storage adapters, domain tools, and deployment

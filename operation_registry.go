@@ -139,6 +139,11 @@ type compiledOperationSchemas struct {
 	output *jsonschema.Schema
 }
 
+type preparedOperationRegistration struct {
+	operation Operation
+	schemas   compiledOperationSchemas
+}
+
 func NewOperationRegistry() *OperationRegistry {
 	return &OperationRegistry{
 		ops:           make(map[string]Operation),
@@ -149,6 +154,14 @@ func NewOperationRegistry() *OperationRegistry {
 }
 
 func (r *OperationRegistry) Register(op Operation) error {
+	return r.RegisterAll([]Operation{op})
+}
+
+// RegisterAll validates, compiles, and registers one operation batch atomically.
+// A duplicate normalized name, existing registration, invalid contract/schema,
+// or frozen registry rejects the complete batch without changing registry state.
+// An empty batch is a no-op on a mutable registry and still observes Freeze.
+func (r *OperationRegistry) RegisterAll(operations []Operation) error {
 	if r == nil {
 		return fmt.Errorf("agent: nil operation registry")
 	}
@@ -157,25 +170,44 @@ func (r *OperationRegistry) Register(op Operation) error {
 	if r.frozen {
 		return errors.New("agent: operation registry is frozen")
 	}
-	if err := normalizeAndValidateOperation(&op); err != nil {
-		return err
+
+	normalized := make([]Operation, len(operations))
+	batchNames := make(map[string]struct{}, len(operations))
+	for i, op := range operations {
+		if err := normalizeAndValidateOperation(&op); err != nil {
+			return err
+		}
+		if _, exists := batchNames[op.Name]; exists {
+			return fmt.Errorf("agent: operation already registered: %s", op.Name)
+		}
+		if _, exists := r.ops[op.Name]; exists {
+			return fmt.Errorf("agent: operation already registered: %s", op.Name)
+		}
+		batchNames[op.Name] = struct{}{}
+		normalized[i] = op
 	}
-	if _, exists := r.ops[op.Name]; exists {
-		return fmt.Errorf("agent: operation already registered: %s", op.Name)
+
+	prepared := make([]preparedOperationRegistration, len(normalized))
+	for i, op := range normalized {
+		schemas, err := compileOperationSchemas(op)
+		if err != nil {
+			return err
+		}
+		op.InputSchema = append(json.RawMessage(nil), op.InputSchema...)
+		op.OutputSchema = append(json.RawMessage(nil), op.OutputSchema...)
+		op.Capabilities = normalizeNames(op.Capabilities)
+		prepared[i] = preparedOperationRegistration{operation: op, schemas: schemas}
 	}
-	schemas, err := compileOperationSchemas(op)
-	if err != nil {
-		return err
-	}
-	op.InputSchema = append(json.RawMessage(nil), op.InputSchema...)
-	op.OutputSchema = append(json.RawMessage(nil), op.OutputSchema...)
-	op.Capabilities = normalizeNames(op.Capabilities)
-	r.ops[op.Name] = op
-	r.inputSchemas[op.Name] = schemas.input
-	r.outputSchemas[op.Name] = schemas.output
-	r.provided[op.Name] = struct{}{}
-	for _, capability := range op.Capabilities {
-		r.provided[capability] = struct{}{}
+
+	for _, registration := range prepared {
+		op := registration.operation
+		r.ops[op.Name] = op
+		r.inputSchemas[op.Name] = registration.schemas.input
+		r.outputSchemas[op.Name] = registration.schemas.output
+		r.provided[op.Name] = struct{}{}
+		for _, capability := range op.Capabilities {
+			r.provided[capability] = struct{}{}
+		}
 	}
 	return nil
 }
