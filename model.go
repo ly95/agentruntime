@@ -187,9 +187,12 @@ type ModelOutputItem struct {
 	Type ModelOutputItemType `json:"type"`
 	Text string              `json:"text,omitempty"`
 	Call *ToolCall           `json:"call,omitempty"`
-	// Raw is the replayable provider envelope. It must be an exact JSON object
-	// whose "type" equals Type; function-call envelopes must also identify the
-	// same call ID, operation name, and semantic arguments as Call. Message and
+	// Raw is the adapter-owned replay envelope. It must be an exact JSON object
+	// in agentruntime's canonical message/reasoning/function_call shape whose
+	// "type" equals Type. An adapter may retain an exact provider object when that
+	// shape is compatible; otherwise it maps provider evidence into this envelope
+	// and reverses that mapping during replay. Function-call envelopes must identify
+	// the same call ID, operation name, and semantic arguments as Call. Message and
 	// reasoning envelopes must retain their required replay field shapes.
 	Raw json.RawMessage `json:"raw,omitempty"`
 }
@@ -203,8 +206,8 @@ type ModelRequest struct {
 	// transports must not serialize it into the provider request.
 	ModelCallID string `json:"-"`
 	// DisableReasoning asks adapters with an explicit thinking mode to turn it
-	// off for this call. Runtime uses it only for the single corrective retry
-	// after a reasoning-only response.
+	// off for this call. Runtime does not toggle it or synthesize corrective
+	// model calls; direct Model callers and explicit decorators own this choice.
 	DisableReasoning bool `json:"disable_reasoning,omitempty"`
 	// ToolSetID is reserved for Runtime's content hash. Direct model callers
 	// should leave it empty; OpenAIModel rejects IDs that do not match Tools.
@@ -315,7 +318,11 @@ type ToolDefinition struct {
 
 // Model executes one native model turn. Input is the complete local transcript;
 // implementations must not depend on provider-side response storage. Requests
-// and their slices are immutable for the duration of Complete.
+// and their slices are immutable for the duration of Complete. Runtime may call
+// Complete concurrently for independent runs, so implementations must be
+// concurrency-safe. StreamSink is synchronous backpressure: Complete must not
+// return while one of its sink invocations is still running, and it must stop all
+// use of the request and StreamSink before it returns.
 type Model interface {
 	Complete(ctx context.Context, req ModelRequest) (*ModelResponse, error)
 }

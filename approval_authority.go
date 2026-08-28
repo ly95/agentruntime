@@ -59,7 +59,26 @@ func (r *Runtime) clonePersistentPendingApprovalCommit(pending PendingApprovalCo
 	}, nil
 }
 
-const pendingApprovalAuthorityVersion uint32 = 1
+// PendingApprovalAuthorityVersion is the current complete durable approval
+// authority schema accepted by RunStore V4.
+const PendingApprovalAuthorityVersion uint32 = 2
+
+const pendingApprovalAuthorityVersion = PendingApprovalAuthorityVersion
+
+// AuthorityDigest computes the canonical complete v2 durable authority digest.
+// RunStore implementations should use this method rather than duplicating the
+// canonical JSON and replay-envelope normalization algorithm.
+func (pending PendingApprovalCommit) AuthorityDigest() (string, error) {
+	return pendingApprovalAuthorityDigest(pending)
+}
+
+// ValidateAuthority verifies the current authority version, checkpoint model
+// binding, and all digest-covered request, decision, audit, input, and replay
+// data. It accepts the exact legacy lexical digest of a complete v2 record for
+// compatibility; AuthorityDigest always returns the canonical current digest.
+func (pending PendingApprovalCommit) ValidateAuthority(modelBindingID string) error {
+	return validatePendingApprovalCommitAuthority(pending, modelBindingID, "pending approval")
+}
 
 // pendingApprovalAuthorityRecord covers the complete persistent commit. The
 // explicit fields preserve semantic Input/OperationSummary members whose
@@ -101,6 +120,39 @@ func pendingApprovalAuthorityRecordForCommit(pending PendingApprovalCommit) pend
 
 func pendingApprovalAuthorityDigest(pending PendingApprovalCommit) (string, error) {
 	return completePendingApprovalAuthorityDigest(pendingApprovalAuthorityRecordForCommit(pending))
+}
+
+func validatePendingApprovalCommitAuthority(pending PendingApprovalCommit, modelBindingID, subject string) error {
+	if err := requireCanonicalIdentity(modelBindingID, "model binding id"); err != nil {
+		return fmt.Errorf("%w: %s has invalid expected model authority: %v", ErrModelBindingMismatch, subject, err)
+	}
+	if pending.AuthorityVersion != PendingApprovalAuthorityVersion {
+		return fmt.Errorf(
+			"%w: %s has unsupported pending approval authority version %d",
+			ErrOperationPlanChanged, subject, pending.AuthorityVersion,
+		)
+	}
+	checkpoint := pending.Request.Checkpoint
+	if checkpoint == nil {
+		return fmt.Errorf("%w: %s has no approval checkpoint", ErrOperationPlanChanged, subject)
+	}
+	if checkpoint.ModelBindingID != modelBindingID {
+		return fmt.Errorf("%w: %s approval checkpoint", ErrModelBindingMismatch, subject)
+	}
+	expected, err := pending.AuthorityDigest()
+	if err != nil {
+		return fmt.Errorf("%w: %s authority cannot be canonicalized: %v", ErrOperationPlanChanged, subject, err)
+	}
+	if err := validateApprovalAuthorityDigest(pending.Digest); err != nil {
+		return fmt.Errorf("%w: %s has invalid authority digest: %v", ErrOperationPlanChanged, subject, err)
+	}
+	if pending.Digest != expected {
+		legacy, legacyErr := legacyPendingApprovalAuthorityDigest(pending)
+		if legacyErr != nil || pending.Digest != legacy {
+			return fmt.Errorf("%w: %s authority digest does not match its complete commit", ErrOperationPlanChanged, subject)
+		}
+	}
+	return nil
 }
 
 func legacyPendingApprovalAuthorityDigest(pending PendingApprovalCommit) (string, error) {
@@ -210,7 +262,7 @@ func canonicalApprovalResumeProjectionPayload(record approvalResumeAuthorityReco
 }
 
 func completePendingApprovalAuthorityDigest(record pendingApprovalAuthorityRecord) (string, error) {
-	if record.AuthorityVersion != pendingApprovalAuthorityVersion {
+	if record.AuthorityVersion != PendingApprovalAuthorityVersion {
 		return "", fmt.Errorf("agent: unsupported pending approval authority version %d", record.AuthorityVersion)
 	}
 	if err := validateUTF8Boundary("pending approval authority", record); err != nil {
@@ -225,7 +277,7 @@ func completePendingApprovalAuthorityDigest(record pendingApprovalAuthorityRecor
 }
 
 func legacyCompletePendingApprovalAuthorityDigest(record pendingApprovalAuthorityRecord) (string, error) {
-	if record.AuthorityVersion != pendingApprovalAuthorityVersion {
+	if record.AuthorityVersion != PendingApprovalAuthorityVersion {
 		return "", fmt.Errorf("agent: unsupported pending approval authority version %d", record.AuthorityVersion)
 	}
 	if err := validateUTF8Boundary("pending approval authority", record); err != nil {

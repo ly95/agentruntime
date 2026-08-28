@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestOpenAIModelRepairsMissingCompletedFunctionArgumentsFromFinalizedStreamItem(
+func TestOpenAIModelUsesDoneEnvelopeWhenCompletedFunctionArgumentsAreMissing(
 	t *testing.T,
 ) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -21,12 +21,12 @@ func TestOpenAIModelRepairsMissingCompletedFunctionArgumentsFromFinalizedStreamI
 		fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"value\\\":\\\"hi\\\"}\",\"item_id\":\"fc_1\",\"output_index\":0,\"sequence_number\":2}\n\n")
 		fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"value\\\":\\\"hi\\\"}\",\"item_id\":\"fc_1\",\"name\":\"echo\",\"output_index\":0,\"sequence_number\":3}\n\n")
 		fmt.Fprint(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{\\\"value\\\":\\\"hi\\\"}\"},\"output_index\":0,\"sequence_number\":4}\n\n")
-		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{\"id\":\"resp_repaired\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"test-model\",\"output\":[{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{\"id\":\"resp_repaired\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"test-model\",\"output\":[{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -49,11 +49,11 @@ func TestOpenAIModelRepairsMissingCompletedFunctionArgumentsFromFinalizedStreamI
 	if err := json.Unmarshal(response.Items[0].Raw, &replayed); err != nil {
 		t.Fatalf("unmarshal replay item: %v", err)
 	}
-	if replayed["arguments"] != `{"value":"hi"}` {
-		t.Fatalf("replayed arguments=%#v", replayed["arguments"])
+	if replayed["arguments"] != `{"value":"hi"}` || replayed["status"] != "completed" {
+		t.Fatalf("replayed done envelope=%#v", replayed)
 	}
 	if _, err := json.Marshal(response); err != nil {
-		t.Fatalf("marshal repaired response: %v", err)
+		t.Fatalf("marshal response: %v", err)
 	}
 }
 
@@ -69,7 +69,7 @@ func TestOpenAIModelRejectsFinalizedArgumentsFromAnotherResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestOpenAIModelRejectsRepeatedStreamLifecycleAndItemIdentities(t *testing.T
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -134,7 +134,7 @@ func TestOpenAIModelDoesNotExecuteUnfinalizedFunctionArgumentDeltas(t *testing.T
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestOpenAIModelRejectsIncompleteOrContradictoryStreamEvidence(t *testing.T)
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -472,9 +472,9 @@ func TestOpenAIModelRejectsUnclassifiedAndContradictoryNonFunctionEvidence(t *te
 		},
 		{
 			name: "immutable response envelope drifts",
-			events: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":1,\"model\":\"model-a\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n" +
-				"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":2,\"model\":\"model-b\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":1}\n\n" +
-				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":3,\"model\":\"model-c\",\"status\":\"completed\",\"output\":[]},\"sequence_number\":2}\n\n" +
+			events: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n" +
+				"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":2,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":1}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_envelope_drift\",\"object\":\"response\",\"created_at\":3,\"model\":\"test-model\",\"status\":\"completed\",\"output\":[]},\"sequence_number\":2}\n\n" +
 				"data: [DONE]\n\n",
 		},
 		{
@@ -586,7 +586,7 @@ func TestOpenAIModelRejectsUnclassifiedAndContradictoryNonFunctionEvidence(t *te
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -803,7 +803,7 @@ func TestOpenAIModelRejectsMalformedPresentImmutableResponseFields(t *testing.T)
 				fmt.Fprint(w, events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}

@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func oldAndRecentTranscript() []ModelInputItem {
 
 func seedContextSession(store *recordingStore, id string, transcript []ModelInputItem, seenCallIDs []string) SessionState {
 	session := SessionState{
-		ID: id, Revision: 3, Transcript: cloneModelInputItems(transcript),
+		ID: id, ModelBindingID: defaultTestModelBindingID(), Revision: 3, Transcript: cloneModelInputItems(transcript),
 		SeenCallIDs:    cloneStringsPreserveNil(seenCallIDs),
 		LastResponseID: "seed-response", LastRunID: "seed-run",
 		CreatedAt: time.Unix(1, 0).UTC(), UpdatedAt: time.Unix(2, 0).UTC(),
@@ -258,26 +259,18 @@ func TestRuntimeMaterializesImageAttachmentsAcrossContextCompactionWithoutPersis
 	}
 }
 
-func TestRuntimeReasoningOnlyRetryReentersContextWindow(t *testing.T) {
+func TestRuntimeContextWindowDoesNotRetryReasoningOnlyResponse(t *testing.T) {
 	counter := &testTokenCounter{
-		countRequest: func(request ModelRequest) (int, error) {
-			switch {
-			case requestHasCheckpoint(request):
-				return 40, nil
-			case request.DisableReasoning:
-				return 100, nil
-			default:
-				return 99, nil
-			}
-		},
-		countText: func(string) (int, error) { return 10, nil },
+		countRequest: func(ModelRequest) (int, error) { return 99, nil },
+		countText:    func(string) (int, error) { return 10, nil },
 	}
 	compactor := &testContextCompactor{compact: func(ContextCompactionRequest) (ContextSummary, error) {
-		return ContextSummary{Summary: "old turn before reasoning-only correction"}, nil
+		t.Fatal("reasoning-only failure unexpectedly triggered compaction")
+		return ContextSummary{}, nil
 	}}
 	model := &scriptedModel{responses: []*ModelResponse{
 		{ID: "reasoning-only", FinishReason: "length", HadReasoning: true, Items: []ModelOutputItem{}},
-		messageResponse("corrected", "done"),
+		messageResponse("must-not-run", "unexpected retry"),
 	}}
 	store := &recordingStore{}
 	seedContextSession(store, "reasoning-only-session", []ModelInputItem{
@@ -286,33 +279,18 @@ func TestRuntimeReasoningOnlyRetryReentersContextWindow(t *testing.T) {
 	}, nil)
 	runtime := newContextRuntimeForTest(t, model, store, contextWindowForTest(counter, compactor), nil)
 
-	result, err := runtime.Run(context.Background(), Input{User: "current", SessionID: "reasoning-only-session"})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	_, err := runtime.Run(context.Background(), Input{User: "current", SessionID: "reasoning-only-session"})
+	if !errors.Is(err, ErrInvalidModelOutput) {
+		t.Fatalf("Run error=%v, want ErrInvalidModelOutput", err)
 	}
-	if result.Output != "done" {
-		t.Fatalf("output=%q", result.Output)
+	if len(counter.requests) != 1 || len(compactor.requests) != 0 {
+		t.Fatalf("counted requests=%d compactor requests=%d, want one model turn without reentry", len(counter.requests), len(compactor.requests))
 	}
-	if len(counter.requests) != 3 {
-		t.Fatalf("counted requests=%d, want initial, correction, and compacted correction", len(counter.requests))
+	if len(model.requests) != 1 || len(model.responses) != 1 {
+		t.Fatalf("model requests=%d remaining responses=%d, want no corrective call", len(model.requests), len(model.responses))
 	}
-	if counter.requests[0].DisableReasoning || requestHasCheckpoint(counter.requests[0]) {
-		t.Fatalf("initial counted request=%+v", counter.requests[0])
-	}
-	if !counter.requests[1].DisableReasoning || requestHasCheckpoint(counter.requests[1]) ||
-		!strings.Contains(counter.requests[1].Instructions, "never return reasoning alone") {
-		t.Fatalf("uncorrected retry was counted: %+v", counter.requests[1])
-	}
-	if !counter.requests[2].DisableReasoning || !requestHasCheckpoint(counter.requests[2]) ||
-		!strings.Contains(counter.requests[2].Instructions, "never return reasoning alone") {
-		t.Fatalf("compacted retry lost correction options: %+v", counter.requests[2])
-	}
-	if len(compactor.requests) != 1 || len(compactor.requests[0].Items) != 2 {
-		t.Fatalf("compactor requests=%+v", compactor.requests)
-	}
-	if len(model.requests) != 2 || !model.requests[1].DisableReasoning || !requestHasCheckpoint(model.requests[1]) ||
-		!strings.Contains(model.requests[1].Instructions, "never return reasoning alone") {
-		t.Fatalf("model requests=%+v", model.requests)
+	if model.requests[0].DisableReasoning || requestHasCheckpoint(model.requests[0]) {
+		t.Fatalf("unexpected reasoning or checkpoint options: %+v", model.requests[0])
 	}
 }
 

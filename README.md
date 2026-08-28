@@ -60,7 +60,7 @@ transition acknowledgements, and reconciliation.
 
 | Runtime owns | Host application owns |
 | --- | --- |
-| Model iteration and OpenAI event mapping | API keys, model selection, and product instructions |
+| Model iteration, provider-neutral model contracts, OpenAI event mapping, and durable binding checks | API keys, model selection, non-secret endpoint/principal labels, injected-client transport/retry policy, and product instructions |
 | Operation contracts and JSON Schema validation | Authorization and capability policy |
 | Approval pause/resume orchestration | Approval UI and approval decisions |
 | Transcript, lease, plan, and execution state transitions | Durable `RunStore` and `ExecutionStore` implementations |
@@ -72,7 +72,7 @@ transition acknowledgements, and reconciliation.
 
 | Type | Purpose |
 | --- | --- |
-| `Model` / `OpenAIModel` | Streams model output into the runtime's provider-neutral event contracts. |
+| `Model` / `BoundModel` / `OpenAIModel` | Streams provider output into neutral event contracts; durable runtimes require an immutable five-part model binding. |
 | `OperationRegistry` / `Operation` | Defines immutable operation names, schemas, effects, capabilities, and confirmation requirements. |
 | `OperationPolicy` | Allows, denies, or routes each proposed operation through approval. |
 | `OperationExecutor` | Performs the host-owned side effect or read and returns schema-validated output. |
@@ -81,6 +81,7 @@ transition acknowledgements, and reconciliation.
 | `RunStore` | Persists sessions and serializes stateful runs with renewable, generation-fenced leases. |
 | `ExecutionStore` | Persists sealed write plans, idempotent execution records, and append-only transitions. |
 | `InMemoryStore` | Provides a concurrency-safe reference implementation for examples and protocol tests; production hosts still need durable transactional storage. |
+| `modeltest` | Exposes the fixed provider-neutral v1 conformance corpus that every model adapter must pass without capability skips. |
 | `OperationReconciler` | Settles uncertain persisted writes without starting a model run. |
 | `ContextWindowConfig` / `EventDispatcher` | Controls transcript compaction and fans structured runtime events out through panic-safe adapters. |
 | `RunOutcome` / `SanitizedEvent` | Maps runtime results and events into stable host-facing status, retry, reconciliation, and safe JSON contracts. |
@@ -97,12 +98,19 @@ The module requires Go 1.26 or newer.
 
 ## Quick start
 
-Set the credentials and model used by the OpenAI Responses API:
+Set the credentials, model, and stable non-secret binding labels used by the
+OpenAI Responses API:
 
 ```bash
 export OPENAI_API_KEY="..."
 export OPENAI_MODEL="your-model-name"
+export OPENAI_ENDPOINT_CLASS="openai-public-api"
+export OPENAI_CREDENTIAL_PRINCIPAL="agent-runtime-development"
 ```
+
+`OPENAI_ENDPOINT_CLASS` is a deployment class, not a URL.
+`OPENAI_CREDENTIAL_PRINCIPAL` identifies the authenticated account or service,
+not its API key or token.
 
 Then create and run a stateless agent:
 
@@ -122,10 +130,12 @@ import (
 func main() {
 	client := openai.NewClient(
 		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
-		option.WithMaxRetries(2),
+		option.WithMaxRetries(2), // Explicit host-owned pre-stream retry policy.
 	)
 	model, err := agentruntime.NewOpenAIModel(client, agentruntime.OpenAIModelConfig{
-		Model: os.Getenv("OPENAI_MODEL"),
+		Model:               os.Getenv("OPENAI_MODEL"),
+		EndpointClass:       os.Getenv("OPENAI_ENDPOINT_CLASS"),
+		CredentialPrincipal: os.Getenv("OPENAI_CREDENTIAL_PRINCIPAL"),
 	})
 	if err != nil {
 		panic(err)
@@ -152,7 +162,7 @@ The `skills` package loads every source through the same `SKILL.md` parser,
 copies all files into an immutable snapshot, and derives deterministic Skill and
 SkillSet hashes. A Runtime freezes the mounted SkillSet at construction and
 adds only each Skill's name, description, and `SKILL.md` body to model
-instructions. For a new Skill-enabled session, `RunStore.CreateRunV3` atomically
+instructions. For a new Skill-enabled session, `RunStore.CreateRunV4` atomically
 creates a revision-zero binding state before the first transcript snapshot can
 exist; later snapshots retain that SkillSet ID. Implementations must compare the
 incoming `RunRecord.SkillSetID` with stored session, waiting-run, and active-run
@@ -216,6 +226,7 @@ The runtime validates required dependencies when it is constructed:
 | Any write operation | `ExecutionStore` in addition to policy and executor |
 | `ConfirmationRequired` operation | `ResultVerifier`; approval flows also use `Approver` and `ApprovalResumer` |
 | Stateful session | `RunStore` |
+| Any configured `RunStore` | The `Model` must implement `BoundModel`; the store must implement the V4 contract. |
 | Custom `IDFactory` (or deprecated `NewID`) or explicit `Input.RunID` | `RunStore` as durable identity authority |
 
 Run identity, approval authority, and operation contracts are versioned and
@@ -225,12 +236,20 @@ interface and configuration documentation (`store.go`, `operation_registry.go`,
 
 - **Run identity**: generated RunIDs only request creation and must collide with
   every existing run; an explicit `Input.RunID` may resume the exact waiting run.
-  `RunStore` adopts the split `CreateRunV3`/`ResumeRunV3` methods and a
+  `RunStore` adopts the split `CreateRunV4`/`ResumeRunV4` methods and a
   synchronous, exactly-once, pre-commit acceptance callback; only an exact
   `ErrRunNotFound` selects the explicit-ID create fallback. A runtime without a
   `RunStore` uses the built-in random factory and rejects custom `IDFactory`
   and deprecated `NewID`. An `IDFactory` returns `(string, error)`, so entropy
   failures remain ordinary runtime errors rather than panics.
+- **Model binding**: a Runtime with `RunStore` requires `BoundModel`. Its
+  immutable `(provider, model, endpoint class, credential principal, adapter
+  version)` binding is hashed with SHA-256; durable run, session, and approval
+  records retain only the resulting `ModelBindingID`. V4 rejects drift and empty
+  legacy bindings without mutation and never infers or upgrades them. An adapter
+  version change creates a new binding, so old runtimes/adapters must remain
+  available to drain their sessions. Secret rotation may retain a binding only
+  when the stable principal is unchanged.
 - **Reconciliation evidence**: a started attempt may only be abandoned with
   durable JSON evidence proving the executor never began, or completed with
   evidence proving it committed; the store fences that exact attempt atomically.
@@ -239,21 +258,27 @@ interface and configuration documentation (`store.go`, `operation_registry.go`,
   plans, executions, reconciliation, and approval resume state, and fails
   explicitly on any mismatch. Terminal writes declare their session projection
   via `ProjectTerminalSession` before execution.
-- **Approval resume**: `RunStore` must round-trip the complete authority-version-1
+- **Approval resume**: `RunStore` must round-trip the complete authority-version-2
   `PendingApprovalCommit` (request, decision, audit, normalized arguments,
-  operation summary, input, checkpoint, and replay) with its digest; pre-versioned
-  subset digests are not resumable. Resume is rejected when the session revision
-  advanced past the checkpoint.
+  operation summary, input identity, checkpoint, and replay) with its digest;
+  older subset authority is not resumable. Resume is rejected when the model
+  binding or input digest changes, or when the session revision advances past
+  the checkpoint.
 - **Model output authority**: `OpenAIModel` enforces one ordered
   `response.created`→`response.completed` lifecycle with strictly increasing
   sequence numbers, exactly-once item add/finalize/complete, argument-delta
   reconciliation against `arguments.done` and the completed response, immutable
-  response-field drift detection, and full replay validation before emitting
-  observer-visible completion. Missing, repeated, out-of-order, unsupported, or
-  contradictory evidence fails as invalid model output. Only function tools are
-  offered to the provider, so tool-call lifecycles for other tool classes
-  (web search, code interpreter, MCP, file search, image generation, custom
-  tools) are rejected as invalid model output.
+  response-field drift detection, exact requested-model validation, and full
+  replay validation before emitting observer-visible completion. Missing,
+  repeated, out-of-order, unsupported, substituted, or contradictory evidence
+  fails as invalid model output. Only function tools are offered to the provider,
+  so tool-call lifecycles for other tool classes (web search, code interpreter,
+  MCP, file search, image generation, custom tools) are rejected as invalid
+  model output.
+- **Adapter conformance**: the public `modeltest` package defines fixed binding,
+  lifecycle, error, usage, cancellation, invalid-output, replay, concurrency, and
+  synchronous sink-lifetime scenarios. Every adapter must pass every scenario;
+  there are no capability flags, provider branches, fallback paths, or skips.
 - **Inputs and bounds**: `Input.IdempotencyScope` is trusted host state, ignored
   by JSON decoding. `RuntimeConfig.MaxCallsPerTurn` bounds one response's
   operation fanout (default 32).
@@ -309,19 +334,25 @@ above.
 
 ## Compatibility and guarantees
 
-- `OpenAIModel` targets the OpenAI Responses API. Client authentication,
-  endpoints, middleware, timeouts, and bounded pre-stream retries are configured
-  on the injected `openai.Client`; compatibility with non-OpenAI implementations
-  is not guaranteed.
+- OpenAI Responses is the only bundled model adapter. The public `modeltest`
+  corpus freezes readiness requirements for additional adapters; no second
+  provider adapter is implemented.
+- `OpenAIModel` targets the OpenAI Responses API and rejects a response whose
+  model differs from the configured request. Compatibility with non-OpenAI
+  implementations is not guaranteed.
+- Client authentication, endpoints, middleware, timeouts, transport, and retry
+  policy belong to the injected `openai.Client`. A host may explicitly configure
+  bounded retries before a response stream starts; Runtime does not add a silent
+  retry after response evidence or retry a semantic model turn.
 - `mcpadapter` targets MCP `2026-07-28` only. Its injected transport owns network,
   credential, dispatch-binding, streaming-limit, and no-retry compliance; older
   protocol fallback is intentionally not performed.
 - Invalid configuration, unsupported provider output, missing resources, and
-  ambiguous execution outcomes fail explicitly.
-- The runtime does not retry semantic model turns or side-effecting operations,
-  downgrade, truncate, or substitute a caller choice. An injected provider client
-  may perform explicitly configured transport retries before a response stream is
-  established.
+  ambiguous execution outcomes fail explicitly. Durable Runtime checks the
+  frozen model binding before and after every provider call, and store adapters
+  must validate complete approval authority with the exported canonical helper.
+- The runtime does not fall back, downgrade, truncate, or substitute a caller's
+  provider, model, operation, or other choice.
 - Operation contracts are frozen when the runtime is constructed; persisted
   write plans and execution transitions are treated as immutable history.
 

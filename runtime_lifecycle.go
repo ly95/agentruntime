@@ -287,6 +287,7 @@ func (r *Runtime) beginRuntimeRun(
 	run := RunRecord{
 		ID:             runID,
 		SessionID:      input.SessionID,
+		ModelBindingID: r.modelBindingID,
 		SkillSetID:     r.skillSetID,
 		OperationSetID: r.operationSetID,
 		Status:         RunStatusRunning,
@@ -348,7 +349,7 @@ func (r *Runtime) beginRuntimeRun(
 		})
 	}
 	create := func() (*agentState, error) {
-		storeErr := validateUTF8Error("run store", r.runStore.CreateRunV3(ctx, createRequest, acceptCreate))
+		storeErr := validateUTF8Error("run store", r.runStore.CreateRunV4(ctx, createRequest, acceptCreate))
 		accepted, err := createAcceptance.finish(storeErr)
 		if err != nil {
 			return nil, err
@@ -382,7 +383,7 @@ func (r *Runtime) beginRuntimeRun(
 		return RunRecord{}, nil, err
 	}
 	resumeAcceptance := runStartAcceptance[resumedRunStart]{label: "resume", route: startRoute}
-	storeErr := r.runStore.ResumeRunV3(ctx, resumeRequest, func(resumed ResumedRun) error {
+	storeErr := r.runStore.ResumeRunV4(ctx, resumeRequest, func(resumed ResumedRun) error {
 		return resumeAcceptance.invoke(func() (resumedRunStart, error) {
 			if cause := context.Cause(ctx); cause != nil {
 				return resumedRunStart{}, cause
@@ -475,7 +476,16 @@ func (r *Runtime) prepareApprovalResume(
 	if r.approvalResumer == nil {
 		return nil, fmt.Errorf("%w: waiting run %s requires a durable approval resumer", ErrApprovalRequired, run.ID)
 	}
+	if err := r.validateCurrentModelBinding(); err != nil {
+		return nil, err
+	}
 	resume, err := r.approvalResumer.ResumeApproval(ctx, run.ID)
+	if bindingErr := r.validateCurrentModelBinding(); bindingErr != nil {
+		if err != nil {
+			bindingErr = errors.Join(bindingErr, validateUTF8Error("approval resumer", err))
+		}
+		return nil, bindingErr
+	}
 	if err != nil {
 		return nil, validateUTF8Error("approval resumer", err)
 	}
@@ -487,6 +497,9 @@ func (r *Runtime) prepareApprovalResume(
 	}
 	if err := validateUTF8Boundary("approval resume", resume); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrOperationPlanChanged, err)
+	}
+	if err := r.validateApprovalResumeModelBinding(state, resume); err != nil {
+		return nil, err
 	}
 	if err := validateApprovalResumeAuthority(state, resume); err != nil {
 		return nil, err
@@ -612,6 +625,9 @@ func (r *Runtime) Run(ctx context.Context, input Input) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := r.validateCurrentModelBinding(); err != nil {
+		return nil, err
+	}
 	ctx, identityScope := r.beginIdentityScope(ctx)
 	defer r.releaseIdentityScope(identityScope)
 	run, state, err := r.beginRuntimeRun(ctx, input)
@@ -719,11 +735,17 @@ func (r *Runtime) stateFromSessionAt(
 		return state, err
 	}
 	if session == nil {
-		if sessionID != "" && (r.skillSetID != "" || r.operationSetID != "") {
-			return state, fmt.Errorf("%w: run store did not return the immutable runtime binding for session %q", ErrSessionConflict, sessionID)
+		if sessionID != "" {
+			return state, fmt.Errorf("%w: run store did not return session %q", ErrSessionConflict, sessionID)
 		}
 		state.sessionReady = true
 		return state, nil
+	}
+	if session.ModelBindingID != r.modelBindingID {
+		return state, fmt.Errorf(
+			"%w: session %q uses model binding %q, current Runtime uses %q",
+			ErrModelBindingMismatch, sessionID, session.ModelBindingID, r.modelBindingID,
+		)
 	}
 	state.loadedOperationSetID = session.OperationSetID
 	if session.SkillSetID != r.skillSetID {
@@ -824,6 +846,9 @@ func (r *Runtime) validatePendingApprovalEnvelope(run RunRecord, inputDigest str
 	}
 	if request.Checkpoint == nil || request.Checkpoint.InputDigest == "" || request.Checkpoint.InputDigest != inputDigest {
 		return nil, "", fmt.Errorf("%w: resumed approval input identity changed", ErrOperationPlanChanged)
+	}
+	if request.Checkpoint.ModelBindingID != r.modelBindingID || run.ModelBindingID != r.modelBindingID {
+		return nil, "", fmt.Errorf("%w: resumed approval model authority changed", ErrModelBindingMismatch)
 	}
 	if err := validatePersistentApprovalOperationInput(run.Input, request.Operation.Input); err != nil {
 		return nil, "", fmt.Errorf("%w: resumed approval operation input changed: %v", ErrOperationPlanChanged, err)

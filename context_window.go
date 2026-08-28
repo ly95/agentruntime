@@ -227,22 +227,11 @@ func buildContextModelRequest(instructions string, tools []ToolDefinition, toolS
 	}, nil
 }
 
-type modelRequestOptions struct {
-	instructionsSuffix string
-	disableReasoning   bool
-}
-
-func applyModelRequestOptions(request *ModelRequest, options modelRequestOptions) {
-	request.Instructions += options.instructionsSuffix
-	request.DisableReasoning = options.disableReasoning
-}
-
 func (r *Runtime) prepareModelRequest(
 	ctx context.Context,
 	run *RunRecord,
 	state *agentState,
 	transcript []ModelInputItem,
-	options modelRequestOptions,
 ) (ModelRequest, []ModelInputItem, error) {
 	modelTranscript, err := materializeModelInputAttachments(ctx, run.Input.ImageAttachmentResolver, transcript)
 	if err != nil {
@@ -252,7 +241,6 @@ func (r *Runtime) prepareModelRequest(
 	if err != nil {
 		return ModelRequest{}, nil, err
 	}
-	applyModelRequestOptions(&request, options)
 	if r.contextWindow == nil {
 		return request, transcript, nil
 	}
@@ -266,7 +254,7 @@ func (r *Runtime) prepareModelRequest(
 	if inputTokens < r.contextWindow.CompactionTriggerTokens {
 		return request, transcript, nil
 	}
-	return r.compactModelRequest(ctx, run, state, transcript, modelTranscript, options, inputTokens)
+	return r.compactModelRequest(ctx, run, state, transcript, modelTranscript, inputTokens)
 }
 
 func (r *Runtime) validateExistingCheckpointTokens(
@@ -328,7 +316,6 @@ func (r *Runtime) compactModelRequest(
 	state *agentState,
 	transcript []ModelInputItem,
 	modelTranscript []ModelInputItem,
-	options modelRequestOptions,
 	inputTokens int,
 ) (ModelRequest, []ModelInputItem, error) {
 	r.emit(Event{
@@ -352,7 +339,7 @@ func (r *Runtime) compactModelRequest(
 		return ModelRequest{}, nil, err
 	}
 	request, retained, compactedTokens, err := r.buildCompactedModelRequest(
-		ctx, run, state, transcript, checkpoint, options, inputTokens, prefixEnd,
+		ctx, run, state, transcript, checkpoint, inputTokens, prefixEnd,
 	)
 	if err != nil {
 		return ModelRequest{}, nil, err
@@ -439,7 +426,6 @@ func (r *Runtime) buildCompactedModelRequest(
 	state *agentState,
 	transcript []ModelInputItem,
 	checkpoint *ContextCheckpoint,
-	options modelRequestOptions,
 	inputTokens int,
 	prefixEnd int,
 ) (ModelRequest, []ModelInputItem, int, error) {
@@ -456,7 +442,6 @@ func (r *Runtime) buildCompactedModelRequest(
 	if err != nil {
 		return ModelRequest{}, nil, 0, r.failContextCompaction(run, inputTokens, prefixEnd, err)
 	}
-	applyModelRequestOptions(&compactedRequest, options)
 	compactedTokens, err := r.countContextModelRequest(
 		ctx, run, compactedRequest, inputTokens, prefixEnd, "compacted model request",
 	)

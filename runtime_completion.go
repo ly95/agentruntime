@@ -246,6 +246,9 @@ func (r *Runtime) enforceDecision(ctx context.Context, run *RunRecord, state *ag
 }
 
 func (r *Runtime) completeModel(ctx context.Context, runID, sessionID string, state *agentState, req ModelRequest) (*ModelResponse, string, error) {
+	if err := r.validateCurrentModelBinding(); err != nil {
+		return nil, "", err
+	}
 	modelCallID, err := r.nextGeneratedID(ctx, "model call id")
 	if err != nil {
 		return nil, "", err
@@ -294,6 +297,16 @@ func (r *Runtime) completeModel(ctx context.Context, runID, sessionID string, st
 	streamMu.Lock()
 	streamErr := streamValidationErr
 	streamMu.Unlock()
+	if bindingErr := r.validateCurrentModelBinding(); bindingErr != nil {
+		if streamErr != nil {
+			bindingErr = errors.Join(bindingErr, streamErr)
+		}
+		if err != nil {
+			bindingErr = errors.Join(bindingErr, validateUTF8Error("model", err))
+		}
+		r.emit(Event{Type: EventModelFailed, RunID: runID, SessionID: sessionID, ModelCallID: modelCallID, ErrorCode: errorCode(bindingErr), Error: bindingErr.Error()})
+		return nil, modelCallID, correlateModelCallError(modelCallID, bindingErr)
+	}
 	if streamErr != nil {
 		if err != nil {
 			streamErr = errors.Join(streamErr, validateUTF8Error("model", err))
@@ -506,7 +519,8 @@ func (r *Runtime) sessionForRun(state *agentState, runID string, cause error) *S
 		operationSetID = ""
 	}
 	session := &SessionState{
-		ID: state.sessionID, SkillSetID: r.skillSetID, OperationSetID: operationSetID, Revision: handle.SessionRevision + 1,
+		ID: state.sessionID, ModelBindingID: r.modelBindingID,
+		SkillSetID: r.skillSetID, OperationSetID: operationSetID, Revision: handle.SessionRevision + 1,
 		Transcript:     clonePersistentModelInputItems(state.transcript),
 		Checkpoint:     cloneContextCheckpoint(state.checkpoint),
 		SeenCallIDs:    sortedCallIDs(transcriptCallIDs(state.transcript)),

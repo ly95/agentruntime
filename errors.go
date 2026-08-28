@@ -34,6 +34,7 @@ var (
 	ErrSessionLeaseLost           = errors.New("agent: session lease ownership lost")
 	ErrSessionStoreNeeded         = errors.New("agent: session store is required")
 	ErrSkillSetMismatch           = errors.New("agent: session SkillSet mismatch")
+	ErrModelBindingMismatch       = errors.New("agent: model binding mismatch")
 	ErrContextLimitExceeded       = errors.New("agent: context limit exceeded")
 	ErrContextCompactionFailed    = errors.New("agent: context compaction failed")
 	ErrImageAttachmentUnavailable = errors.New("agent: image attachment unavailable")
@@ -118,6 +119,8 @@ func errorCode(err error) string {
 		return "session_store_required"
 	case errors.Is(err, ErrSkillSetMismatch):
 		return "skill_set_mismatch"
+	case errors.Is(err, ErrModelBindingMismatch):
+		return "model_binding_mismatch"
 	case errors.Is(err, ErrContextLimitExceeded):
 		return "context_limit_exceeded"
 	case errors.Is(err, ErrContextCompactionFailed):

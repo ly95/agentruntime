@@ -1,12 +1,16 @@
 package agentruntime
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/openai/openai-go/v3/option"
 )
 
 func TestOpenAIModelValidatesFinalResponseBeforeResponseDone(t *testing.T) {
@@ -19,7 +23,7 @@ func TestOpenAIModelValidatesFinalResponseBeforeResponseDone(t *testing.T) {
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -55,7 +59,7 @@ func TestOpenAIModelAcceptsValidatedAuxiliaryLifecycleAndExplicitEmptyArguments(
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -142,7 +146,7 @@ func TestOpenAIModelAcceptsConsistentReasoningAndAnnotationLifecycles(t *testing
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -184,7 +188,7 @@ func TestOpenAIModelRejectsUnboundStreamEventCoordinates(t *testing.T) {
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -217,6 +221,14 @@ func TestOpenAIModelRejectsFunctionArgumentEvidenceWithoutArgumentsDone(t *testi
 				"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"value\\\":\\\"delta\\\"}\",\"item_id\":\"fc_1\",\"output_index\":0,\"sequence_number\":2}\n\n" +
 				"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{\\\"value\\\":\\\"final\\\"}\"},\"output_index\":0,\"sequence_number\":3}\n\n",
 		},
+		{
+			name: "consistent completed call still omits arguments done",
+			events: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_consistent_without_done\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n" +
+				"data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"in_progress\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"},\"output_index\":0,\"sequence_number\":1}\n\n" +
+				"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"},\"output_index\":0,\"sequence_number\":2}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_consistent_without_done\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"completed\",\"output\":[{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"}]},\"sequence_number\":3}\n\n" +
+				"data: [DONE]\n\n",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -225,7 +237,7 @@ func TestOpenAIModelRejectsFunctionArgumentEvidenceWithoutArgumentsDone(t *testi
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -265,7 +277,7 @@ func TestOpenAIModelRejectsReasoningDriftBetweenItemAddedAndDone(t *testing.T) {
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -288,7 +300,7 @@ func TestOpenAIModelRejectsTransportErrorAfterCompletedResponse(t *testing.T) {
 		fmt.Fprint(w, "data: {not-json}\n\n")
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -301,8 +313,265 @@ func TestOpenAIModelRejectsTransportErrorAfterCompletedResponse(t *testing.T) {
 	if response != nil || err == nil || !strings.Contains(err.Error(), "OpenAI stream failed") {
 		t.Fatalf("Complete response=%+v error=%v, want trailing transport failure", response, err)
 	}
-	if len(chunks) < 2 || chunks[len(chunks)-2].Type != ModelStreamResponseDone ||
-		chunks[len(chunks)-1].Type != ModelStreamError || chunks[len(chunks)-1].ErrorCode != "transport_error" {
-		t.Fatalf("chunks=%+v, want response done followed by transport error", chunks)
+	if len(chunks) != 2 || chunks[0].Type != ModelStreamResponseStarted ||
+		chunks[1].Type != ModelStreamError || chunks[1].ErrorCode != "transport_error" {
+		t.Fatalf("chunks=%+v, want response started followed by transport error without response done", chunks)
 	}
+}
+
+func TestOpenAIModelRejectsCloseErrorAfterCompletedResponse(t *testing.T) {
+	const marker = "private-openai-close-error"
+	closeErr := errors.New(marker)
+	body := newOpenAILifecycleStreamBody(
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_close_error\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n"+
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_close_error\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"completed\",\"output\":[]},\"sequence_number\":1}\n\n"+
+			"data: [DONE]\n\n",
+		nil,
+		closeErr,
+	)
+	model := newOpenAILifecycleBodyModel(t, body)
+	var chunks []ModelStreamEvent
+	response, err := model.Complete(t.Context(), ModelRequest{
+		Instructions: "Answer the user.",
+		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
+		StreamSink:   func(event ModelStreamEvent) { chunks = append(chunks, event) },
+	})
+	if response != nil || err == nil || !errors.Is(err, closeErr) {
+		t.Fatalf("Complete response=%+v error=%v, want close failure", response, err)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatalf("top-level close error leaked private marker: %v", err)
+	}
+	var transportErr *openAIStreamTransportError
+	if !errors.As(err, &transportErr) || transportErr == nil || errors.Unwrap(transportErr) != closeErr {
+		t.Fatalf("close error chain=%v transport=%v, want directly unwrappable private cause", err, transportErr)
+	}
+	if category, ok := ProviderErrorCategoryOf(err); ok {
+		t.Fatalf("plain close error category=%q, want uncategorized sanitized transport error", category)
+	}
+	if body.closeCalls != 1 {
+		t.Fatalf("stream body close calls=%d, want 1", body.closeCalls)
+	}
+	transportEvents := 0
+	for _, chunk := range chunks {
+		switch chunk.Type {
+		case ModelStreamError:
+			if chunk.ErrorCode == "transport_error" {
+				transportEvents++
+			}
+		case ModelStreamResponseDone:
+			t.Fatalf("close failure emitted response_done: %+v", chunks)
+		}
+	}
+	if transportEvents != 1 {
+		t.Fatalf("transport errors=%d chunks=%+v, want one", transportEvents, chunks)
+	}
+}
+
+func TestOpenAIModelDoesNotClassifyNetworkCloseAfterCompletedResponseAsRetryable(t *testing.T) {
+	closeErr := &openAILifecycleNetError{message: "private-completed-network-close"}
+	body := newOpenAILifecycleStreamBody(
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_network_close\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n"+
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_network_close\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"completed\",\"output\":[]},\"sequence_number\":1}\n\n"+
+			"data: [DONE]\n\n",
+		nil,
+		closeErr,
+	)
+	model := newOpenAILifecycleBodyModel(t, body)
+
+	response, err := model.Complete(t.Context(), ModelRequest{
+		Instructions: "Answer the user.",
+		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
+	})
+	if response != nil || err == nil || !errors.Is(err, closeErr) {
+		t.Fatalf("Complete response=%+v error=%v, want network close failure", response, err)
+	}
+	if category, ok := ProviderErrorCategoryOf(err); ok || category != "" || IsRetryableProviderError(err) {
+		t.Fatalf("completed close category=%q ok=%v retryable=%v", category, ok, IsRetryableProviderError(err))
+	}
+}
+
+func TestOpenAIModelKeepsTerminalAuthenticationCategoryWithTrailingTransportErrors(t *testing.T) {
+	const (
+		authMarker  = "private-terminal-auth-error"
+		readMarker  = "private-trailing-read-error"
+		closeMarker = "private-trailing-close-error"
+	)
+	readErr := &openAILifecycleNetError{message: readMarker}
+	closeErr := &openAILifecycleNetError{message: closeMarker}
+	body := newOpenAILifecycleStreamBody(
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_auth_trailing\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n"+
+			"data: {\"type\":\"error\",\"sequence_number\":1,\"code\":\"invalid_api_key\",\"message\":\""+authMarker+"\",\"param\":\"request\"}\n\n",
+		readErr,
+		closeErr,
+	)
+	model := newOpenAILifecycleBodyModel(t, body)
+	var chunks []ModelStreamEvent
+	response, err := model.Complete(t.Context(), ModelRequest{
+		Instructions: "Answer the user.",
+		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
+		StreamSink:   func(event ModelStreamEvent) { chunks = append(chunks, event) },
+	})
+	if response != nil || err == nil || !errors.Is(err, ErrProviderAuthentication) {
+		t.Fatalf("Complete response=%+v error=%v, want authentication failure", response, err)
+	}
+	if errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("terminal authentication also matched transient provider failure: %v", err)
+	}
+	if !errors.Is(err, readErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("terminal error=%v does not retain read=%v and close=%v causes", err, readErr, closeErr)
+	}
+	if category, ok := ProviderErrorCategoryOf(err); !ok || category != ProviderErrorAuthentication || IsRetryableProviderError(err) {
+		t.Fatalf("category=%q ok=%v retryable=%v, want non-retryable authentication", category, ok, IsRetryableProviderError(err))
+	}
+	if providers := countOpenAILifecycleProviderErrors(err); providers != 1 {
+		t.Fatalf("provider errors in chain=%d error=%v, want exactly one", providers, err)
+	}
+	for _, marker := range []string{authMarker, readMarker, closeMarker} {
+		if strings.Contains(err.Error(), marker) {
+			t.Fatalf("top-level terminal error leaked %q: %v", marker, err)
+		}
+	}
+	if body.closeCalls != 1 {
+		t.Fatalf("stream body close calls=%d, want 1", body.closeCalls)
+	}
+	errorEvents := 0
+	for _, chunk := range chunks {
+		switch chunk.Type {
+		case ModelStreamResponseDone:
+			t.Fatalf("terminal authentication failure emitted response_done: %+v", chunks)
+		case ModelStreamError:
+			errorEvents++
+			if chunk.ProviderType != "error" {
+				t.Fatalf("terminal authentication emitted second public error category: %+v", chunks)
+			}
+		}
+	}
+	if errorEvents != 1 {
+		t.Fatalf("terminal authentication stream errors=%d, want one: %+v", errorEvents, chunks)
+	}
+}
+
+func TestOpenAIModelPreservesStreamCancellation(t *testing.T) {
+	body := newOpenAILifecycleStreamBody("", context.Canceled, nil)
+	model := newOpenAILifecycleBodyModel(t, body)
+	var chunks []ModelStreamEvent
+	response, err := model.Complete(t.Context(), ModelRequest{
+		Instructions: "Answer the user.",
+		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
+		StreamSink:   func(event ModelStreamEvent) { chunks = append(chunks, event) },
+	})
+	if response != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Complete response=%+v error=%v, want context.Canceled", response, err)
+	}
+	if errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("cancellation was classified as transient provider failure: %v", err)
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		t.Fatalf("cancellation exposed ProviderError=%+v", providerErr)
+	}
+	if body.closeCalls != 1 {
+		t.Fatalf("stream body close calls=%d, want 1", body.closeCalls)
+	}
+	for _, chunk := range chunks {
+		if chunk.Type == ModelStreamResponseDone {
+			t.Fatalf("cancellation emitted response_done: %+v", chunks)
+		}
+	}
+}
+
+type openAILifecycleStreamBody struct {
+	reader     *strings.Reader
+	readErr    error
+	closeErr   error
+	closeCalls int
+}
+
+func newOpenAILifecycleStreamBody(payload string, readErr, closeErr error) *openAILifecycleStreamBody {
+	return &openAILifecycleStreamBody{
+		reader:   strings.NewReader(payload),
+		readErr:  readErr,
+		closeErr: closeErr,
+	}
+}
+
+func (body *openAILifecycleStreamBody) Read(p []byte) (int, error) {
+	n, err := body.reader.Read(p)
+	if err == io.EOF && body.readErr != nil {
+		readErr := body.readErr
+		body.readErr = nil
+		return n, readErr
+	}
+	return n, err
+}
+
+func (body *openAILifecycleStreamBody) Close() error {
+	body.closeCalls++
+	return body.closeErr
+}
+
+type openAILifecycleRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip openAILifecycleRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func newOpenAILifecycleBodyModel(t *testing.T, body *openAILifecycleStreamBody) *OpenAIModel {
+	t.Helper()
+	httpClient := &http.Client{Transport: openAILifecycleRoundTripper(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	model, err := NewOpenAIModel(
+		newOpenAITestClient(
+			"https://openai-lifecycle.invalid/v1",
+			option.WithHTTPClient(httpClient),
+		),
+		openAITestModelConfig("test-model"),
+	)
+	if err != nil {
+		t.Fatalf("NewOpenAIModel: %v", err)
+	}
+	return model
+}
+
+type openAILifecycleNetError struct {
+	message string
+}
+
+func (err *openAILifecycleNetError) Error() string {
+	return err.message
+}
+
+func (*openAILifecycleNetError) Timeout() bool {
+	return false
+}
+
+func (*openAILifecycleNetError) Temporary() bool {
+	return true
+}
+
+func countOpenAILifecycleProviderErrors(err error) int {
+	if err == nil {
+		return 0
+	}
+	count := 0
+	if _, ok := err.(*ProviderError); ok {
+		count++
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range wrapped.Unwrap() {
+			count += countOpenAILifecycleProviderErrors(child)
+		}
+	case interface{ Unwrap() error }:
+		count += countOpenAILifecycleProviderErrors(wrapped.Unwrap())
+	}
+	return count
 }

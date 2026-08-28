@@ -35,7 +35,7 @@ func TestOpenAIStreamGoldenCorpus(t *testing.T) {
 				_, _ = writer.Write(payload)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatal(err)
 			}

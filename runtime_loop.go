@@ -61,11 +61,31 @@ func (r *Runtime) validateApprovalResumePayload(state *agentState, resume *Appro
 // validateApprovalResumeImmutablePayload performs only Runtime-owned,
 // deterministic validation. It is safe inside a RunStore transaction: it does
 // not invoke host normalization or preview callbacks.
+func (r *Runtime) validateApprovalResumeModelBinding(state *agentState, resume *ApprovalResume) error {
+	if resume != nil && resume.Checkpoint != nil && resume.Checkpoint.ModelBindingID != r.modelBindingID {
+		return fmt.Errorf("%w: approval resume model authority changed", ErrModelBindingMismatch)
+	}
+	if state != nil && state.resumedApproval != nil && state.resumedApproval.Request.Checkpoint != nil &&
+		state.resumedApproval.Request.Checkpoint.ModelBindingID != r.modelBindingID {
+		return fmt.Errorf("%w: durable approval model authority changed", ErrModelBindingMismatch)
+	}
+	return nil
+}
+
 func (r *Runtime) validateApprovalResumeImmutablePayload(state *agentState, resume *ApprovalResume) (ToolCall, error) {
+	if err := r.validateApprovalResumeModelBinding(state, resume); err != nil {
+		return ToolCall{}, err
+	}
+	if resume == nil || resume.Checkpoint == nil {
+		return ToolCall{}, fmt.Errorf("%w: approval resume model authority changed", ErrModelBindingMismatch)
+	}
+	if state == nil || state.resumedApproval == nil || state.resumedApproval.Request.Checkpoint == nil {
+		return ToolCall{}, fmt.Errorf("%w: durable approval model authority changed", ErrModelBindingMismatch)
+	}
 	if err := validateApprovalResumeAuthority(state, resume); err != nil {
 		return ToolCall{}, err
 	}
-	if resume == nil || strings.TrimSpace(resume.ID) == "" || strings.TrimSpace(resume.ExecutionID) == "" ||
+	if strings.TrimSpace(resume.ID) == "" || strings.TrimSpace(resume.ExecutionID) == "" ||
 		strings.TrimSpace(resume.Operation) == "" || strings.TrimSpace(resume.ResponseID) == "" {
 		return ToolCall{}, fmt.Errorf("%w: incomplete approval resume state", ErrInvalidModelOutput)
 	}
@@ -74,7 +94,7 @@ func (r *Runtime) validateApprovalResumeImmutablePayload(state *agentState, resu
 		return ToolCall{}, fmt.Errorf("%w: approval %s has invalid model output: %v", ErrOperationPlanChanged, resume.ID, err)
 	}
 	checkpoint := resume.Checkpoint
-	if checkpoint == nil || checkpoint.OperationBatchCount == 0 || checkpoint.PlanBatchIndex+1 != checkpoint.OperationBatchCount ||
+	if checkpoint.OperationBatchCount == 0 || checkpoint.PlanBatchIndex+1 != checkpoint.OperationBatchCount ||
 		checkpoint.PlanCallID != resume.Call.ID || checkpoint.PlanExecutionID != resume.ExecutionID || strings.TrimSpace(checkpoint.InputDigest) == "" {
 		return ToolCall{}, fmt.Errorf("%w: approval %s has an incomplete operation checkpoint", ErrOperationPlanChanged, resume.ID)
 	}
@@ -476,24 +496,11 @@ func (r *Runtime) completeAgentModel(
 	state *agentState,
 	transcript []ModelInputItem,
 ) (*ModelResponse, string, []ModelInputItem, error) {
-	request, transcript, err := r.prepareModelRequest(
-		ctx, run, state, transcript, modelRequestOptions{},
-	)
+	request, transcript, err := r.prepareModelRequest(ctx, run, state, transcript)
 	if err != nil {
 		return nil, "", nil, err
 	}
 	response, modelCallID, err := r.completeModel(ctx, run.ID, run.SessionID, state, request)
-	if err != nil || !reasoningOnlyResponse(response) {
-		return response, modelCallID, transcript, err
-	}
-	retryRequest, transcript, err := r.prepareModelRequest(ctx, run, state, transcript, modelRequestOptions{
-		instructionsSuffix: reasoningOnlyCorrection,
-		disableReasoning:   true,
-	})
-	if err != nil {
-		return nil, "", nil, err
-	}
-	response, modelCallID, err = r.completeModel(ctx, run.ID, run.SessionID, state, retryRequest)
 	return response, modelCallID, transcript, err
 }
 

@@ -85,6 +85,9 @@ func (r *Runtime) resumeApprovedOperation(ctx context.Context, run *RunRecord, i
 			return nil, "", err
 		}
 	}
+	if err := r.validateCurrentModelBinding(); err != nil {
+		return nil, "", err
+	}
 
 	state.checkpoint = candidateState.checkpoint
 	state.seenCallIDs = candidateState.seenCallIDs
@@ -209,20 +212,6 @@ func operationToolResultCancelled(result json.RawMessage) (bool, error) {
 		return false, errors.New("operation tool result cancelled field must be a boolean")
 	}
 	return cancelled, nil
-}
-
-const reasoningOnlyCorrection = "\n\nThe previous model call produced internal reasoning but no user-visible answer or function call. Complete the current turn now. Return either a final answer or one or more valid function calls; never return reasoning alone."
-
-func reasoningOnlyResponse(response *ModelResponse) bool {
-	if response == nil || !response.HadReasoning || strings.TrimSpace(response.OutputText) != "" || strings.TrimSpace(response.Refusal) != "" {
-		return false
-	}
-	for _, item := range response.Items {
-		if item.Type == ModelOutputFunctionCall && item.Call != nil {
-			return false
-		}
-	}
-	return true
 }
 
 func (r *Runtime) modelRequest(state *agentState, transcript []ModelInputItem) (ModelRequest, error) {
@@ -562,7 +551,8 @@ func (r *Runtime) approvalCheckpointForOperation(state *agentState, transcript [
 		return nil, err
 	}
 	checkpoint := &ApprovalCheckpoint{
-		Transcript: cloneModelInputItems(transcript), ContextCheckpoint: cloneContextCheckpoint(state.checkpoint),
+		ModelBindingID: r.modelBindingID,
+		Transcript:     cloneModelInputItems(transcript), ContextCheckpoint: cloneContextCheckpoint(state.checkpoint),
 		SeenCallIDs: sortedCallIDs(transcriptCallIDs(transcript)), OperationBatchCount: state.operationBatchCount,
 		PlanCallID: state.planCallID, PlanExecutionID: state.planExecutionID,
 		InputDigest: inputDigest, ExpectedSessionRevision: r.expectedWaitingApprovalSessionRevision(state),
@@ -585,7 +575,7 @@ func (r *Runtime) expectedWaitingApprovalSessionRevision(state *agentState) uint
 }
 
 func (r *Runtime) commitsNewWaitingApprovalSession(state *agentState) bool {
-	return state != nil && state.sessionID != "" && (r.skillSetID != "" || r.operationSetID != "") &&
+	return state != nil && state.sessionID != "" && r.modelBindingID != "" &&
 		!(r.operationSetID != "" && state.loadedOperationSetID == "")
 }
 

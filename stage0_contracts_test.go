@@ -180,8 +180,25 @@ func TestOpenAIProviderErrorClassification(t *testing.T) {
 				t.Fatalf("errorCode=%q, want %q", code, test.errorCode)
 			}
 			var providerErr *ProviderError
-			if !errors.As(classified, &providerErr) || providerErr.RequestID != "req-test" {
+			if !errors.As(classified, &providerErr) || providerErr.RequestID != "" || providerErr.Code != test.code {
 				t.Fatalf("ProviderError=%+v", providerErr)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name     string
+		status   int
+		values   []string
+		category ProviderErrorCategory
+	}{
+		{name: "HTTP authentication overrides quota code", status: http.StatusUnauthorized, values: []string{"insufficient_quota"}, category: ProviderErrorAuthentication},
+		{name: "HTTP bad request rejects misleading rate token", status: http.StatusBadRequest, values: []string{"not_rate_limited"}, category: ProviderErrorRejected},
+		{name: "conflicting code metadata is rejected", values: []string{"invalid_api_key", "rate_limit_exceeded"}, category: ProviderErrorRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := openAIProviderCategory(test.status, test.values...); got != test.category {
+				t.Fatalf("category=%q, want %q", got, test.category)
 			}
 		})
 	}

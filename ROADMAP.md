@@ -21,12 +21,15 @@ runtime contract.
   [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md), the
   [adapter guide](docs/mcp-adapter-guide.md), and
   [tracking issue #4](https://github.com/ly95/agentruntime/issues/4).
-- **Additional model provider readiness — next design gate:** freeze the adapter
-  contract, durable provider binding, lifecycle/error/usage/cancellation rules,
-  and provider-neutral positive and negative conformance corpus before choosing
-  or implementing a second provider. See
-  [ADR 0002](docs/adr/0002-remote-mcp-provider-boundaries.md), the
-  [provider compatibility guide](docs/provider-compatibility.md), and
+- **Additional model provider readiness — implemented:** the public fixed-v1
+  `modeltest` corpus freezes mandatory lifecycle, error, usage, cancellation,
+  invalid-output, privacy, replay, concurrency, sink-lifetime, and
+  immutable-binding behavior without capability skips. Durable runtimes require
+  a five-part `BoundModel` identity
+  and `RunStore` V4 persists only its SHA-256 binding ID. This readiness contract
+  does not add a second provider: OpenAI Responses remains the only bundled model
+  adapter. See the [provider compatibility guide](docs/provider-compatibility.md),
+  the [store adapter guide](docs/store-adapter-guide.md), and
   [tracking issue #5](https://github.com/ly95/agentruntime/issues/5).
 
 ## Known limits

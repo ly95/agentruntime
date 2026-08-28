@@ -22,6 +22,14 @@ include explicit compatibility guidance.
   `mcpadapter` for bounded MCP `2026-07-28` discovery of host-allowlisted,
   synchronous read tools with immutable binding/schema digests and structured
   result validation.
+- Public provider-neutral `modeltest` v1 conformance corpus with mandatory
+  binding, lifecycle, error, usage, cancellation, invalid-output, privacy,
+  replay, concurrency, and synchronous sink-lifetime scenarios with no
+  capability skips. This readiness gate does not bundle a second provider
+  adapter; OpenAI Responses remains the only bundled adapter.
+- Immutable `BoundModel`/`ModelBinding` authority over provider, model, endpoint
+  class, credential principal, and adapter version, represented in durable
+  runtime records by a versioned SHA-256 binding ID.
 
 ### Changed
 
@@ -34,7 +42,32 @@ include explicit compatibility guidance.
 - Failed, interrupted, and cancelled runs atomically commit their error audit
   item or explicitly record `audit_missing`.
 - OpenAI semantic validation is split by protocol domain and protected by a
-  checked-in golden stream corpus.
+  checked-in golden stream corpus. Responses must report the exact configured
+  model; fallback, downgrade, and provider/model substitution remain forbidden.
+- `NewOpenAIModel` now requires stable, non-secret `EndpointClass` and
+  `CredentialPrincipal` labels for every caller, including stateless runtimes.
+  Existing `OpenAIModelConfig{Model: ...}` construction must add both labels;
+  secret rotation keeps the label only when the authenticated principal remains
+  the same.
+- Durable runtimes now require `BoundModel`, and `RunStore` advances to the V4
+  create/resume contract with atomic model-binding checks. Empty legacy bindings
+  are rejected rather than inferred or upgraded; adapter-version changes create
+  new bindings and require old runtimes/adapters to drain their existing
+  sessions.
+- Pending approval authority advances to version 2 and binds the complete
+  persistent request, decision, audit, input identity, checkpoint, and replay.
+  `PendingApprovalCommit.AuthorityDigest` and `ValidateAuthority` expose the one
+  canonical algorithm to store adapters. Missing authority/session rows and
+  digest drift fail atomically; older subset authority is not resumable.
+- OpenAI streaming now rejects unfinished items, disappearing immutable response
+  fields, late text evidence, and successful function calls without argument
+  finalization. Public replay data comes from an actual provider item envelope,
+  and trailing transport failures do not emit a second terminal error category.
+- The injected OpenAI client remains host-owned for endpoint, authentication,
+  transport, timeout, and retry policy. Runtime adds no silent model retry;
+  reasoning-only responses without text, refusal, or function calls now fail
+  explicitly with `ErrInvalidModelOutput` instead of triggering a hidden
+  corrective model turn.
 
 ### Removed
 
@@ -50,7 +83,9 @@ include explicit compatibility guidance.
 ### Security
 
 - Added approval UI and log guidance, redaction helpers, strict provider
-  authority validation, and immutable resource access rules.
+  authority validation, non-secret endpoint/principal binding labels, and
+  immutable resource access rules. Durable records retain only the model binding
+  digest, never credentials or endpoint URLs.
 - Remote MCP reads keep transport credentials and SSRF policy host-owned and
   strip untrusted schema annotation text before model exposure. Generated
   operations require explicit host read-only attestation and reject a

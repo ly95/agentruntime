@@ -19,6 +19,9 @@ is fully offline.
 ```bash
 export OPENAI_API_KEY="..."
 export OPENAI_MODEL="..."
+# Required stable, non-secret binding labels. Do not put URLs, keys, or tokens here.
+export OPENAI_ENDPOINT_CLASS="openai-public"
+export OPENAI_CREDENTIAL_PRINCIPAL="service-account-name"
 # Optional; defaults to https://api.openai.com/v1
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
@@ -33,6 +36,11 @@ go run ./examples/operations "Use the tool to add 19 and 23."
 go run ./examples/skill "Analyze this text: small tools make agents easier to test."
 go run ./examples/approval
 ```
+
+`OPENAI_ENDPOINT_CLASS` identifies the deployment class rather than the literal
+endpoint URL. `OPENAI_CREDENTIAL_PRINCIPAL` identifies the stable account or
+service identity rather than its rotating secret. The examples do not infer
+these values from `OPENAI_BASE_URL` or `OPENAI_API_KEY`.
 
 The operations example registers `math_add` in `OperationRegistry`. The runtime
 offers that contract to the model as a function tool. Policy and execution stay

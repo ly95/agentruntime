@@ -400,10 +400,14 @@ func TestRuntimeRejectsMissingBeginRunSkillBinding(t *testing.T) {
 }
 
 func TestRunStoreRejectsFinishRunSkillBindingRewrite(t *testing.T) {
+	modelBindingID := defaultTestModelBindingID()
 	store := &recordingStore{sessions: map[string]SessionState{
-		"binding-session": {ID: "binding-session", SkillSetID: "set-a"},
+		"binding-session": {ID: "binding-session", ModelBindingID: modelBindingID, SkillSetID: "set-a"},
 	}}
-	run := RunRecord{ID: "binding-run", SessionID: "binding-session", SkillSetID: "set-a", Status: RunStatusRunning}
+	run := RunRecord{
+		ID: "binding-run", SessionID: "binding-session", ModelBindingID: modelBindingID,
+		SkillSetID: "set-a", Status: RunStatusRunning,
+	}
 	begun, err := createRunForTest(t.Context(), store, CreateRunRequest{Run: run, LeaseID: "binding-lease", LeaseTTL: defaultSessionLeaseTTL})
 	if err != nil {
 		t.Fatal(err)
@@ -413,7 +417,7 @@ func TestRunStoreRejectsFinishRunSkillBindingRewrite(t *testing.T) {
 	rewritten.Status = RunStatusCompleted
 	err = store.FinishRun(t.Context(), FinishRunRequest{
 		Handle: begun.Handle, Run: rewritten,
-		Session: &SessionState{ID: run.SessionID, SkillSetID: "set-b", Revision: 1},
+		Session: &SessionState{ID: run.SessionID, ModelBindingID: modelBindingID, SkillSetID: "set-b", Revision: 1},
 	})
 	if !errors.Is(err, ErrSkillSetMismatch) {
 		t.Fatalf("FinishRun error=%v", err)
@@ -529,7 +533,8 @@ func TestRuntimeRejectsUnanchoredLegacyApprovalBeforeBindingClaim(t *testing.T) 
 	set, _ := oneRuntimeSkill(t, "new-skill", "NEW_SKILL_BODY")
 	input := Input{RunID: "legacy-waiting-run", SessionID: "legacy-waiting-session", User: "poll approval"}
 	store := &recordingStore{runs: []RunRecord{{
-		ID: input.RunID, SessionID: input.SessionID, Status: RunStatusWaitingUser, Input: input,
+		ID: input.RunID, SessionID: input.SessionID, ModelBindingID: defaultTestModelBindingID(),
+		Status: RunStatusWaitingUser, Input: input,
 	}}}
 	resumer := pendingOnlyApprovalResumer{runID: input.RunID}
 	mismatched, err := NewRuntime(RuntimeConfig{

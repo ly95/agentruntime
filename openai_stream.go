@@ -18,6 +18,7 @@ import (
 
 type openAIStreamState struct {
 	parsed                *ModelResponse
+	expectedModel         string
 	responseID            string
 	responseCreated       bool
 	terminal              bool
@@ -48,7 +49,9 @@ type openAIStreamState struct {
 	partAnnotations       map[openAIStreamAnnotationKey]json.RawMessage
 	partAnnotationCounts  map[openAIStreamTextKey]int64
 	annotations           map[openAIStreamAnnotationKey]json.RawMessage
+	protocolError         error
 	terminalError         error
+	completedChunk        *ModelStreamEvent
 	lastRawJSON           json.RawMessage
 }
 
@@ -73,9 +76,25 @@ type openAIStreamFunctionCall struct {
 	Finalized            bool
 }
 
-func newOpenAIStreamState(sink ModelStreamSink) *openAIStreamState {
+type openAIStreamTransportError struct {
+	cause error
+}
+
+func (*openAIStreamTransportError) Error() string {
+	return "agent: OpenAI stream failed"
+}
+
+func (err *openAIStreamTransportError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
+
+func newOpenAIStreamState(sink ModelStreamSink, expectedModel string) *openAIStreamState {
 	return &openAIStreamState{
 		sink:                 sink,
+		expectedModel:        expectedModel,
 		messagePhases:        make(map[string]responses.ResponseOutputMessagePhase),
 		callIDs:              make(map[string]string),
 		functionCalls:        make(map[string]openAIStreamFunctionCall),
@@ -279,24 +298,55 @@ func newOpenAIStreamChunk(event responses.ResponseStreamEventUnion, eventType Mo
 }
 
 func (state *openAIStreamState) finish(streamErr error) (*ModelResponse, error) {
+	if state.protocolError != nil {
+		if streamErr != nil {
+			return nil, errors.Join(
+				state.protocolError,
+				&openAIStreamTransportError{cause: streamErr},
+			)
+		}
+		return nil, state.protocolError
+	}
 	if streamErr != nil {
+		if state.terminalError != nil {
+			// A terminal provider or model-output error remains authoritative.
+			// Preserve trailing private transport detail without emitting or
+			// classifying a second public terminal error.
+			return nil, errors.Join(
+				state.terminalError,
+				&openAIStreamTransportError{cause: streamErr},
+			)
+		}
 		state.emit(ModelStreamEvent{
 			Type:         ModelStreamError,
 			ProviderType: "transport.error",
 			ErrorCode:    "transport_error",
 			ErrorMessage: streamErr.Error(),
 		})
-		transportErr := fmt.Errorf("agent: OpenAI stream failed: %w", streamErr)
-		if state.terminalError != nil {
-			return nil, errors.Join(state.terminalError, transportErr)
+		if state.parsed != nil {
+			// A completed response followed by a read or close failure is ambiguous,
+			// not a safe request-level retry. Preserve the private cause without
+			// classifying it as transient provider unavailability.
+			return nil, &openAIStreamTransportError{cause: streamErr}
+		}
+		transportErr := classifyOpenAIError(streamErr)
+		var providerErr *ProviderError
+		if !errors.As(transportErr, &providerErr) {
+			// Keep private transport detail available through Unwrap without
+			// exposing it through the top-level error string.
+			transportErr = &openAIStreamTransportError{cause: streamErr}
 		}
 		return nil, transportErr
 	}
-	if state.parsed != nil {
-		return state.parsed, nil
-	}
 	if state.terminalError != nil {
 		return nil, state.terminalError
+	}
+	if state.parsed != nil {
+		if state.completedChunk == nil {
+			return nil, fmt.Errorf("%w: OpenAI completed response has no terminal stream evidence", ErrInvalidModelOutput)
+		}
+		state.emit(*state.completedChunk)
+		return state.parsed, nil
 	}
 	state.emit(ModelStreamEvent{
 		Type:         ModelStreamError,
@@ -305,7 +355,7 @@ func (state *openAIStreamState) finish(streamErr error) (*ModelResponse, error) 
 		ErrorMessage: "stream ended without response.completed",
 		RawJSON:      string(state.lastRawJSON),
 	})
-	return nil, errors.New("agent: OpenAI stream ended without response.completed")
+	return nil, fmt.Errorf("%w: OpenAI stream ended without response.completed", ErrInvalidModelOutput)
 }
 
 func (state *openAIStreamState) requireActiveResponse(eventType string) error {
@@ -352,6 +402,13 @@ func (state *openAIStreamState) bindResponseEnvelope(eventType string, response 
 	}
 	if err := validateOpenAIImmutableResponseFieldTypes(eventType, response, fields); err != nil {
 		return err
+	}
+	if state.responseEnvelopeBound {
+		for name := range state.responseFields {
+			if _, exists := fields[name]; !exists {
+				return fmt.Errorf("%w: OpenAI %s omitted immutable response field %q", ErrInvalidModelOutput, eventType, name)
+			}
+		}
 	}
 	for name, fieldRaw := range fields {
 		if !openAIImmutableResponseField(name) {
@@ -848,13 +905,15 @@ func (state *openAIStreamState) validatePartAnnotations(key openAIStreamTextKey,
 	return nil
 }
 
-func (state *openAIStreamState) reconcileOpenAINonFunctionItem(doneRaw, completedRaw json.RawMessage, itemType, itemID string) error {
+func (state *openAIStreamState) reconcileOpenAIItem(doneRaw, completedRaw json.RawMessage, itemType, itemID string) error {
 	var fields []string
 	switch itemType {
 	case string(ModelOutputMessage):
-		fields = []string{"phase", "role", "content"}
+		fields = []string{"status", "phase", "role", "content"}
 	case string(ModelOutputReasoning):
-		fields = []string{"summary", "content", "encrypted_content"}
+		fields = []string{"status", "summary", "content", "encrypted_content"}
+	case string(ModelOutputFunctionCall):
+		fields = []string{"status"}
 	default:
 		return nil
 	}
@@ -874,6 +933,20 @@ func (state *openAIStreamState) reconcileOpenAINonFunctionItem(doneRaw, complete
 	for _, field := range fields {
 		doneField, doneHas := doneObject[field]
 		completedField, completedHas := completedObject[field]
+		if field == "status" && itemType != string(ModelOutputMessage) {
+			if !doneHas {
+				continue
+			}
+			if !completedHas {
+				// A reasoning or function-call status is optional in the SDK;
+				// response.completed supplies the terminal completed authority.
+				completedField = string(responses.ResponseStatusCompleted)
+			}
+			if !exactJSONValuesEqual(doneField, completedField) {
+				return fmt.Errorf("%w: OpenAI %s item %q %s changed after item done", ErrInvalidModelOutput, itemType, itemID, field)
+			}
+			continue
+		}
 		if doneHas != completedHas {
 			return fmt.Errorf("%w: OpenAI %s item %q %s changed after item done", ErrInvalidModelOutput, itemType, itemID, field)
 		}
@@ -885,8 +958,16 @@ func (state *openAIStreamState) reconcileOpenAINonFunctionItem(doneRaw, complete
 }
 
 func (state *openAIStreamState) reconcileCompletedResponse(response *responses.Response) error {
+	for itemID := range state.addedItems {
+		if _, done := state.doneItems[itemID]; !done {
+			return fmt.Errorf("%w: OpenAI completed response left output item %q unfinished", ErrInvalidModelOutput, itemID)
+		}
+	}
 	completedIDs := make(map[string]struct{}, len(response.Output))
 	for index, item := range response.Output {
+		if err := validateOpenAIStreamItem(item, responses.ResponseStatusCompleted, "response.completed"); err != nil {
+			return err
+		}
 		itemID := item.ID
 		if _, exists := state.doneItems[itemID]; !exists {
 			return fmt.Errorf("%w: OpenAI completed response contains unstreamed output item %q", ErrInvalidModelOutput, itemID)
@@ -897,6 +978,13 @@ func (state *openAIStreamState) reconcileCompletedResponse(response *responses.R
 		}
 		if expectedIndex, ok := state.itemIndexes[itemID]; !ok || expectedIndex != int64(index) {
 			return fmt.Errorf("%w: OpenAI completed output item %q identity contradicts stream", ErrInvalidModelOutput, itemID)
+		}
+		doneRaw, ok := state.doneItemJSON[itemID]
+		if !ok {
+			return fmt.Errorf("%w: OpenAI completed output item %q is missing its done payload", ErrInvalidModelOutput, itemID)
+		}
+		if err := state.reconcileOpenAIItem(doneRaw, json.RawMessage(item.RawJSON()), item.Type, itemID); err != nil {
+			return err
 		}
 		if item.Type == string(ModelOutputFunctionCall) {
 			call := item.AsFunctionCall()
@@ -912,14 +1000,6 @@ func (state *openAIStreamState) reconcileCompletedResponse(response *responses.R
 					return fmt.Errorf("%w: OpenAI completed function call %q arguments contradict finalized stream", ErrInvalidModelOutput, itemID)
 				}
 			}
-			continue
-		}
-		doneRaw, ok := state.doneItemJSON[itemID]
-		if !ok {
-			return fmt.Errorf("%w: OpenAI completed output item %q is missing its done payload", ErrInvalidModelOutput, itemID)
-		}
-		if err := state.reconcileOpenAINonFunctionItem(doneRaw, json.RawMessage(item.RawJSON()), item.Type, itemID); err != nil {
-			return err
 		}
 	}
 	for itemID := range state.doneItems {
@@ -930,6 +1010,19 @@ func (state *openAIStreamState) reconcileCompletedResponse(response *responses.R
 	parsed, err := parseOpenAIResponseWithFinalizedCalls(response, state.functionCalls)
 	if err != nil {
 		return err
+	}
+	for index := range parsed.Items {
+		if parsed.Items[index].Type != ModelOutputFunctionCall || response.Output[index].AsFunctionCall().Arguments != "" {
+			continue
+		}
+		doneRaw, ok := state.doneItemJSON[parsed.Items[index].ID]
+		if !ok {
+			return fmt.Errorf("%w: OpenAI completed function call %q has no replayable output_item.done envelope", ErrInvalidModelOutput, parsed.Items[index].ID)
+		}
+		parsed.Items[index].Raw = append(json.RawMessage(nil), doneRaw...)
+		if err := validateModelOutputItem(parsed.Items[index]); err != nil {
+			return fmt.Errorf("%w: OpenAI completed function call %q output_item.done envelope cannot be replayed: %v", ErrInvalidModelOutput, parsed.Items[index].ID, err)
+		}
 	}
 	state.parsed = parsed
 	return nil
@@ -943,8 +1036,11 @@ func (state *openAIStreamState) acceptResponseCreated(event responses.ResponseSt
 	if created.Status != responses.ResponseStatusInProgress || len(created.Output) != 0 {
 		return fmt.Errorf("%w: OpenAI response.created must contain an in-progress response with no output", ErrInvalidModelOutput)
 	}
-	if strings.TrimSpace(string(created.Model)) == "" || created.CreatedAt < 0 || !created.JSON.CreatedAt.Valid() {
-		return fmt.Errorf("%w: OpenAI response.created has invalid model or created_at", ErrInvalidModelOutput)
+	if created.CreatedAt < 0 || !created.JSON.CreatedAt.Valid() {
+		return fmt.Errorf("%w: OpenAI response.created has invalid created_at", ErrInvalidModelOutput)
+	}
+	if err := state.requireExpectedResponseModel(event.Type, created); err != nil {
+		return state.rejectResponseModelAuthority(event, err)
 	}
 	if err := state.bindResponseEnvelope(event.Type, created); err != nil {
 		return err
@@ -961,6 +1057,9 @@ func (state *openAIStreamState) acceptResponseInProgress(event responses.Respons
 	if err := state.bindResponseID(event.Type, response.ID, false); err != nil {
 		return err
 	}
+	if err := state.requireExpectedResponseModel(event.Type, response); err != nil {
+		return state.rejectResponseModelAuthority(event, err)
+	}
 	return state.bindResponseEnvelope(event.Type, response)
 }
 
@@ -972,24 +1071,61 @@ func (state *openAIStreamState) acceptResponseCompleted(event responses.Response
 	if err := state.bindResponseID(event.Type, response.ID, false); err != nil {
 		return err
 	}
+	if err := state.requireExpectedResponseModel(event.Type, response); err != nil {
+		return state.rejectResponseModelAuthority(event, err)
+	}
 	if err := state.bindResponseEnvelope(event.Type, response); err != nil {
 		return err
 	}
 	if err := state.reconcileCompletedResponse(&response); err != nil {
 		return err
 	}
-	state.emit(newOpenAIStreamChunk(event, ModelStreamResponseDone))
+	chunk := newOpenAIStreamChunk(event, ModelStreamResponseDone)
+	state.completedChunk = &chunk
 	state.terminal = true
 	return nil
 }
 
+func (state *openAIStreamState) requireExpectedResponseModel(eventType string, response responses.Response) error {
+	if !response.JSON.Model.Valid() {
+		return fmt.Errorf("%w: OpenAI %s is missing response.model", ErrInvalidModelOutput, eventType)
+	}
+	if string(response.Model) != state.expectedModel {
+		return fmt.Errorf("%w: OpenAI %s response.model does not match the requested model", ErrInvalidModelOutput, eventType)
+	}
+	return nil
+}
+
+func (state *openAIStreamState) rejectResponseModelAuthority(event responses.ResponseStreamEventUnion, authorityErr error) error {
+	chunk := newOpenAIStreamChunk(event, ModelStreamError)
+	chunk.ErrorCode = "invalid_model_output"
+	chunk.ErrorMessage = authorityErr.Error()
+	state.emit(chunk)
+	return authorityErr
+}
+
 func (state *openAIStreamState) acceptResponseFailure(event responses.ResponseStreamEventUnion) error {
+	if err := state.requireActiveResponse(event.Type); err != nil {
+		return err
+	}
+	response := event.Response
+	if err := state.bindResponseID(event.Type, response.ID, false); err != nil {
+		return err
+	}
+	if err := state.requireExpectedResponseModel(event.Type, response); err != nil {
+		return state.rejectResponseModelAuthority(event, err)
+	}
+	if err := state.bindResponseEnvelope(event.Type, response); err != nil {
+		return err
+	}
+	if err := validateOpenAIResponseEventStatus(event.Type, response.Status); err != nil {
+		return err
+	}
 	status := "failed"
 	if event.Type == "response.incomplete" {
 		status = "incomplete"
 	}
-	response := event.Response
-	message := openAIStreamResponseError(status, response).Error()
+	privateCause := openAIStreamResponseError(status, response)
 	code := strings.TrimSpace(string(response.Error.Code))
 	if status == "incomplete" {
 		code = "incomplete"
@@ -997,12 +1133,22 @@ func (state *openAIStreamState) acceptResponseFailure(event responses.ResponseSt
 	if code == "" {
 		code = "unknown_error"
 	}
+	category := openAIProviderCategory(0, code)
+	publicCode := openAIProviderPublicCode(category, code)
 	chunk := newOpenAIStreamChunk(event, ModelStreamError)
-	chunk.ErrorCode = code
-	chunk.ErrorMessage = message
+	chunk.ErrorCode = publicCode
+	chunk.ErrorMessage = privateCause.Error()
 	state.emit(chunk)
 	state.terminal = true
-	state.terminalError = errors.New(message)
+	if status == "incomplete" {
+		state.terminalError = fmt.Errorf("%w: OpenAI response was incomplete", ErrInvalidModelOutput)
+		return nil
+	}
+	providerErr, err := NewProviderError("openai", category, publicCode, 0, "", privateCause)
+	if err != nil {
+		return err
+	}
+	state.terminalError = providerErr
 	return nil
 }
 
@@ -1017,7 +1163,11 @@ func (state *openAIStreamState) acceptOutputItemAdded(event responses.ResponseSt
 	if err := state.acceptItemEvent(event); err != nil {
 		return err
 	}
-	state.emit(newOpenAIStreamChunk(event, ModelStreamItemAdded))
+	chunk := newOpenAIStreamChunk(event, ModelStreamItemAdded)
+	// output_item.added carries the item identity inside the item envelope,
+	// not in a top-level item_id field.
+	chunk.ItemID = item.ID
+	state.emit(chunk)
 	return nil
 }
 
@@ -1026,6 +1176,12 @@ func (state *openAIStreamState) acceptOutputItemDone(event responses.ResponseStr
 		return err
 	}
 	item := event.Item
+	if item.Type == string(ModelOutputFunctionCall) && state.itemTypes[item.ID] == string(ModelOutputFunctionCall) &&
+		string(item.AsFunctionCall().Status) != string(responses.ResponseStatusIncomplete) {
+		if _, finalized := state.argumentsDone[item.ID]; !finalized {
+			return fmt.Errorf("%w: OpenAI function call %q ended before function_call_arguments.done", ErrInvalidModelOutput, item.ID)
+		}
+	}
 	if err := state.observeItem(item.ID, event.OutputIndex, item.Type, false, true); err != nil {
 		return err
 	}
@@ -1084,7 +1240,6 @@ func (state *openAIStreamState) acceptFunctionCallArgumentsDone(event responses.
 	if err := state.validateFunctionArgumentEvidence(itemID, event.Arguments); err != nil {
 		return err
 	}
-	state.argumentsDone[itemID] = struct{}{}
 	fc := state.functionCalls[itemID]
 	if fc.Name != "" && event.Name != "" && fc.Name != event.Name {
 		return fmt.Errorf("%w: OpenAI function call %q name conflicts with its finalized arguments", ErrInvalidModelOutput, itemID)
@@ -1095,6 +1250,7 @@ func (state *openAIStreamState) acceptFunctionCallArgumentsDone(event responses.
 	fc.Arguments = event.Arguments
 	fc.Finalized = true
 	state.functionCalls[itemID] = fc
+	state.argumentsDone[itemID] = struct{}{}
 	chunk := newOpenAIStreamChunk(event, ModelStreamToolArgumentsDone)
 	chunk.Name = event.Name
 	chunk.Arguments = event.Arguments
@@ -1143,6 +1299,12 @@ func (state *openAIStreamState) acceptDeltaEvent(event responses.ResponseStreamE
 		key = openAIStreamTextKey{ItemID: itemID, Kind: "reasoning_text", Index: event.ContentIndex}
 	default:
 		return openAIUnsupportedStreamEventError(event.Type)
+	}
+	if _, done := state.textDone[key]; done {
+		return fmt.Errorf("%w: OpenAI %s arrived after text done for item %q", ErrInvalidModelOutput, event.Type, itemID)
+	}
+	if _, done := state.partsDone[key]; done {
+		return fmt.Errorf("%w: OpenAI %s arrived after content part done for item %q", ErrInvalidModelOutput, event.Type, itemID)
 	}
 	state.textEvidence[key] += event.Delta
 	if chunkType != "" {
@@ -1328,6 +1490,12 @@ func (state *openAIStreamState) acceptAnnotationAdded(event responses.ResponseSt
 		return fmt.Errorf("%w: OpenAI %s targets non-message item %q", ErrInvalidModelOutput, event.Type, itemID)
 	}
 	key := openAIStreamTextKey{ItemID: itemID, Kind: "output_text", Index: event.ContentIndex}
+	if _, done := state.textDone[key]; done {
+		return fmt.Errorf("%w: OpenAI output text annotation arrived after text done for item %q", ErrInvalidModelOutput, itemID)
+	}
+	if _, done := state.partsDone[key]; done {
+		return fmt.Errorf("%w: OpenAI output text annotation arrived after content part done for item %q", ErrInvalidModelOutput, itemID)
+	}
 	count := state.partAnnotationCounts[key]
 	if event.AnnotationIndex != count {
 		return fmt.Errorf("%w: OpenAI output text annotation append skips an index", ErrInvalidModelOutput)
@@ -1347,11 +1515,18 @@ func (state *openAIStreamState) acceptAnnotationAdded(event responses.ResponseSt
 }
 
 func (state *openAIStreamState) acceptErrorEvent(event responses.ResponseStreamEventUnion) error {
+	privateCause := fmt.Errorf("OpenAI response error %s: %s", event.Code, event.Message)
+	category := openAIProviderCategory(0, event.Code)
+	publicCode := openAIProviderPublicCode(category, event.Code)
 	chunk := newOpenAIStreamChunk(event, ModelStreamError)
-	chunk.ErrorCode = event.Code
+	chunk.ErrorCode = publicCode
 	chunk.ErrorMessage = event.Message
 	state.emit(chunk)
 	state.terminal = true
-	state.terminalError = fmt.Errorf("agent: OpenAI response error: %s: %s", event.Code, event.Message)
+	providerErr, err := NewProviderError("openai", category, publicCode, 0, "", privateCause)
+	if err != nil {
+		return err
+	}
+	state.terminalError = providerErr
 	return nil
 }

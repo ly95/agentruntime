@@ -16,6 +16,12 @@ import (
 	"github.com/openai/openai-go/v3/shared"
 )
 
+func openAITestModelConfig(model shared.ResponsesModel) OpenAIModelConfig {
+	return OpenAIModelConfig{
+		Model: model, EndpointClass: "test-endpoint", CredentialPrincipal: "test-principal",
+	}
+}
+
 func newOpenAITestClient(baseURL string, opts ...option.RequestOption) openai.Client {
 	clientOpts := []option.RequestOption{
 		option.WithAPIKey("sk-test"),
@@ -32,7 +38,7 @@ func TestOpenAIModelUsesStreamingResponsesTransport(t *testing.T) {
 	defer server.Close()
 
 	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{
-		Model:     "test-model",
+		Model: "test-model", EndpointClass: "test-endpoint", CredentialPrincipal: "test-principal",
 		Reasoning: &shared.ReasoningParam{Effort: shared.ReasoningEffortHigh, Summary: shared.ReasoningSummaryDetailed},
 	})
 	if err != nil {
@@ -178,7 +184,7 @@ func TestOpenAIModelHonorsDisableReasoning(t *testing.T) {
 	defer server.Close()
 
 	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{
-		Model:     "test-model",
+		Model: "test-model", EndpointClass: "test-endpoint", CredentialPrincipal: "test-principal",
 		Reasoning: &shared.ReasoningParam{Effort: shared.ReasoningEffortHigh, Summary: shared.ReasoningSummaryDetailed},
 	})
 	if err != nil {
@@ -210,7 +216,7 @@ func TestOpenAIModelReplaysEncryptedReasoningForStatelessToolContinuation(t *tes
 	defer server.Close()
 
 	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{
-		Model:     "test-model",
+		Model: "test-model", EndpointClass: "test-endpoint", CredentialPrincipal: "test-principal",
 		Reasoning: &shared.ReasoningParam{Effort: shared.ReasoningEffortHigh, Summary: shared.ReasoningSummaryDetailed},
 	})
 	if err != nil {
@@ -350,7 +356,7 @@ func TestOpenAIModelStreamsAndReturnsRefusal(t *testing.T) {
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -384,7 +390,7 @@ func TestOpenAIModelCompletesWithoutStreamSink(t *testing.T) {
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -417,7 +423,7 @@ func TestOpenAIModelUsesInjectedClientRetryPolicyBeforeStreaming(t *testing.T) {
 	defer server.Close()
 
 	client := newOpenAITestClient(server.URL+"/v1", option.WithMaxRetries(1))
-	model, err := NewOpenAIModel(client, OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(client, openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -448,9 +454,40 @@ func assertStreamChunk(t *testing.T, chunks []ModelStreamEvent, eventType ModelS
 	return ModelStreamEvent{}
 }
 
+func TestNewOpenAIModelRejectsSecretOrURLBindingLabels(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		endpointClass       string
+		credentialPrincipal string
+	}{
+		{
+			name: "endpoint URL", endpointClass: "https://api.openai.com/v1",
+			credentialPrincipal: "service-account",
+		},
+		{
+			name: "API key", endpointClass: "openai-public-api",
+			credentialPrincipal: "sk-live-secret",
+		},
+		{
+			name: "bearer token", endpointClass: "openai-public-api",
+			credentialPrincipal: "Bearer private-token",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model, err := NewOpenAIModel(newOpenAITestClient("https://example.com/v1"), OpenAIModelConfig{
+				Model: "test-model", EndpointClass: test.endpointClass,
+				CredentialPrincipal: test.credentialPrincipal,
+			})
+			if err == nil || model != nil {
+				t.Fatalf("NewOpenAIModel model=%v error=%v, want rejected binding label", model, err)
+			}
+		})
+	}
+}
+
 func TestNewOpenAIModelValidatesReasoningConfiguration(t *testing.T) {
 	_, err := NewOpenAIModel(newOpenAITestClient("https://example.com/v1"), OpenAIModelConfig{
-		Model:     "test-model",
+		Model: "test-model", EndpointClass: "test-endpoint", CredentialPrincipal: "test-principal",
 		Reasoning: &shared.ReasoningParam{Effort: shared.ReasoningEffortNone, Summary: shared.ReasoningSummaryAuto},
 	})
 	if err == nil || !strings.Contains(err.Error(), "summary must be omitted") {
@@ -481,7 +518,7 @@ func TestOpenAIModelRejectsStreamWithoutCompletedEvent(t *testing.T) {
 	defer server.Close()
 
 	client := newOpenAITestClient(server.URL+"/v1", option.WithMaxRetries(2))
-	model, err := NewOpenAIModel(client, OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(client, openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -527,7 +564,7 @@ func TestOpenAIModelRejectsUnofferedToolLifecycleEvents(t *testing.T) {
 				fmt.Fprint(w, "data: [DONE]\n\n")
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -555,7 +592,7 @@ func TestOpenAIModelAcceptsRefusalDoneLifecycle(t *testing.T) {
 	}))
 	defer server.Close()
 
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}

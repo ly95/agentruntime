@@ -22,13 +22,15 @@ func TestOpenAIModelEmitsStructuredErrorChunks(t *testing.T) {
 		hasSequence  bool
 	}{
 		{
-			name:         "failed",
-			payload:      "data: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"},\"output\":[]}}\n\n",
+			name: "failed",
+			payload: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+				"data: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"},\"output\":[]}}\n\n",
 			providerType: "response.failed", code: "server_error", hasSequence: true,
 		},
 		{
-			name:         "incomplete",
-			payload:      "data: {\"type\":\"response.incomplete\",\"sequence_number\":2,\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n",
+			name: "incomplete",
+			payload: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_incomplete\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+				"data: {\"type\":\"response.incomplete\",\"sequence_number\":2,\"response\":{\"id\":\"resp_incomplete\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n",
 			providerType: "response.incomplete", code: "incomplete", hasSequence: true,
 		},
 		{
@@ -50,7 +52,7 @@ func TestOpenAIModelEmitsStructuredErrorChunks(t *testing.T) {
 			}))
 			defer server.Close()
 
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -75,6 +77,689 @@ func TestOpenAIModelEmitsStructuredErrorChunks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenAIModelRejectsTerminalFailureAuthority(t *testing.T) {
+	const privateModel = "provider-private-model-marker"
+	responseEvent := func(eventType string, sequence int64, response map[string]any) map[string]any {
+		return map[string]any{"type": eventType, "sequence_number": sequence, "response": response}
+	}
+	failed := func(id, model string) map[string]any {
+		response := openAIEventsTestResponse(id, model, "failed")
+		response["error"] = map[string]any{"code": "server_error", "message": "private failure"}
+		return response
+	}
+	incomplete := func(id, model string) map[string]any {
+		response := openAIEventsTestResponse(id, model, "incomplete")
+		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		return response
+	}
+
+	tests := []struct {
+		name   string
+		marker string
+		build  func() []map[string]any
+	}{
+		{
+			name: "failed requires response created",
+			build: func() []map[string]any {
+				return []map[string]any{responseEvent("response.failed", 0, failed("resp_failed", "test-model"))}
+			},
+		},
+		{
+			name: "incomplete requires response created",
+			build: func() []map[string]any {
+				return []map[string]any{responseEvent("response.incomplete", 0, incomplete("resp_incomplete", "test-model"))}
+			},
+		},
+		{
+			name: "failed response id must match",
+			build: func() []map[string]any {
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.failed", 1, failed("resp_other", "test-model")),
+				}
+			},
+		},
+		{
+			name: "incomplete response id must match",
+			build: func() []map[string]any {
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.incomplete", 1, incomplete("resp_other", "test-model")),
+				}
+			},
+		},
+		{
+			name: "failed response model is required",
+			build: func() []map[string]any {
+				terminal := failed("resp_authority", "")
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.failed", 1, terminal),
+				}
+			},
+		},
+		{
+			name:   "incomplete response model must match without leaking",
+			marker: privateModel,
+			build: func() []map[string]any {
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.incomplete", 1, incomplete("resp_authority", privateModel)),
+				}
+			},
+		},
+		{
+			name: "failed immutable envelope must match",
+			build: func() []map[string]any {
+				terminal := failed("resp_authority", "test-model")
+				terminal["created_at"] = int64(2)
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.failed", 1, terminal),
+				}
+			},
+		},
+		{
+			name: "failed event status must agree",
+			build: func() []map[string]any {
+				terminal := failed("resp_authority", "test-model")
+				terminal["status"] = "completed"
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.failed", 1, terminal),
+				}
+			},
+		},
+		{
+			name: "incomplete event status must agree",
+			build: func() []map[string]any {
+				terminal := incomplete("resp_authority", "test-model")
+				terminal["status"] = "completed"
+				return []map[string]any{
+					openAIEventsTestCreated("resp_authority", 0),
+					responseEvent("response.incomplete", 1, terminal),
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(test.build()...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+				t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
+			}
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("failed Complete emitted response_done: %+v", chunks)
+				}
+			}
+			if test.marker == "" {
+				return
+			}
+			if strings.Contains(err.Error(), test.marker) {
+				t.Fatalf("top-level model authority error leaked provider model: %v", err)
+			}
+			trustedRaw := false
+			for _, chunk := range chunks {
+				if chunk.Type != ModelStreamError || !strings.Contains(chunk.RawJSON, test.marker) {
+					continue
+				}
+				trustedRaw = true
+				public, marshalErr := json.Marshal(chunk)
+				if marshalErr != nil {
+					t.Fatalf("Marshal stream error: %v", marshalErr)
+				}
+				if strings.Contains(string(public), test.marker) {
+					t.Fatalf("public stream error leaked provider model: %s", public)
+				}
+			}
+			if !trustedRaw {
+				t.Fatalf("trusted stream events did not retain model mismatch RawJSON: %+v", chunks)
+			}
+		})
+	}
+}
+
+func TestOpenAIStreamTerminalProviderErrorClassification(t *testing.T) {
+	const marker = "provider-private-stream-message"
+	tests := []struct {
+		name      string
+		eventType string
+		code      string
+		category  ProviderErrorCategory
+		sentinel  error
+		retryable bool
+	}{
+		{name: "error authentication", eventType: "error", code: "invalid_api_key", category: ProviderErrorAuthentication, sentinel: ErrProviderAuthentication},
+		{name: "error quota", eventType: "error", code: "insufficient_quota", category: ProviderErrorQuota, sentinel: ErrProviderQuotaExceeded},
+		{name: "error rate limit", eventType: "error", code: "rate_limit_exceeded", category: ProviderErrorRateLimit, sentinel: ErrProviderRateLimited, retryable: true},
+		{name: "error rejected", eventType: "error", code: "invalid_request_error", category: ProviderErrorRejected, sentinel: ErrProviderRequestRejected},
+		{name: "error transient", eventType: "error", code: "server_error", category: ProviderErrorTransient, sentinel: ErrProviderUnavailable, retryable: true},
+		{name: "failed rate limit", eventType: "response.failed", code: "rate_limit_exceeded", category: ProviderErrorRateLimit, sentinel: ErrProviderRateLimited, retryable: true},
+		{name: "failed rejected", eventType: "response.failed", code: "invalid_prompt", category: ProviderErrorRejected, sentinel: ErrProviderRequestRejected},
+		{name: "failed transient", eventType: "response.failed", code: "vector_store_timeout", category: ProviderErrorTransient, sentinel: ErrProviderUnavailable, retryable: true},
+	}
+	providerSentinels := []error{
+		ErrProviderAuthentication,
+		ErrProviderQuotaExceeded,
+		ErrProviderRateLimited,
+		ErrProviderRequestRejected,
+		ErrProviderUnavailable,
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			events := []map[string]any{openAIEventsTestCreated("resp_provider_failure", 0)}
+			if test.eventType == "error" {
+				events = append(events, map[string]any{
+					"type": "error", "sequence_number": int64(1), "code": test.code,
+					"message": marker, "param": "request",
+				})
+			} else {
+				terminal := openAIEventsTestResponse("resp_provider_failure", "test-model", "failed")
+				terminal["error"] = map[string]any{"code": test.code, "message": marker}
+				events = append(events, map[string]any{
+					"type": "response.failed", "sequence_number": int64(1), "response": terminal,
+				})
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || err == nil || !errors.Is(err, test.sentinel) {
+				t.Fatalf("Complete response=%+v error=%v, want %v", response, err, test.sentinel)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("top-level provider error leaked private message: %v", err)
+			}
+			category, ok := ProviderErrorCategoryOf(err)
+			if !ok || category != test.category || IsRetryableProviderError(err) != test.retryable {
+				t.Fatalf("category=%q ok=%v retryable=%v", category, ok, IsRetryableProviderError(err))
+			}
+			for _, sentinel := range providerSentinels {
+				if sentinel != test.sentinel && errors.Is(err, sentinel) {
+					t.Fatalf("provider error also matched contradictory sentinel %v", sentinel)
+				}
+			}
+			var providerErr *ProviderError
+			if !errors.As(err, &providerErr) || providerErr == nil {
+				t.Fatalf("error=%v does not expose *ProviderError", err)
+			}
+			if providerErr.StatusCode != 0 || providerErr.RequestID != "" || providerErr.Code != test.code {
+				t.Fatalf("ProviderError=%+v, stream response id must not become HTTP request id", providerErr)
+			}
+			if cause := providerErr.Unwrap(); cause == nil || !strings.Contains(cause.Error(), marker) {
+				t.Fatalf("trusted provider cause=%v does not retain private message", cause)
+			}
+			trustedFailure := false
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("provider failure emitted response_done: %+v", chunks)
+				}
+				if chunk.Type == ModelStreamError && strings.Contains(chunk.ErrorMessage, marker) && strings.Contains(chunk.RawJSON, marker) {
+					trustedFailure = true
+				}
+			}
+			if !trustedFailure {
+				t.Fatalf("trusted stream events did not retain private failure: %+v", chunks)
+			}
+		})
+	}
+}
+
+func TestOpenAIStreamRejectsEventAfterProviderTerminalAsProtocolError(t *testing.T) {
+	const marker = "provider-private-terminal-before-protocol-error"
+	inProgress := openAIEventsTestResponse("resp_terminal_then_event", "test-model", "in_progress")
+	events := []map[string]any{
+		openAIEventsTestCreated("resp_terminal_then_event", 0),
+		{
+			"type": "error", "sequence_number": int64(1), "code": "server_error",
+			"message": marker, "param": "request",
+		},
+		{
+			"type": "response.in_progress", "sequence_number": int64(2), "response": inProgress,
+		},
+	}
+
+	response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+	if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+		t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
+	}
+	if category, ok := ProviderErrorCategoryOf(err); ok || category != "" || IsRetryableProviderError(err) {
+		t.Fatalf("protocol error category=%q ok=%v retryable=%v", category, ok, IsRetryableProviderError(err))
+	}
+	for _, chunk := range chunks {
+		if chunk.Type == ModelStreamResponseDone {
+			t.Fatalf("terminal protocol violation emitted response_done: %+v", chunks)
+		}
+	}
+}
+
+func TestOpenAIStreamOutputItemStatusMatchesLifecycle(t *testing.T) {
+	allItemTypes := []string{"message", "reasoning", "function_call"}
+	lifecycleTests := []struct {
+		name          string
+		eventType     string
+		status        any
+		includeStatus bool
+		itemTypes     []string
+	}{
+		{name: "added missing required status", eventType: "response.output_item.added", itemTypes: []string{"message"}},
+		{name: "added null status", eventType: "response.output_item.added", includeStatus: true, itemTypes: allItemTypes},
+		{name: "added completed status", eventType: "response.output_item.added", status: "completed", includeStatus: true, itemTypes: allItemTypes},
+		{name: "added incomplete status", eventType: "response.output_item.added", status: "incomplete", includeStatus: true, itemTypes: allItemTypes},
+		{name: "done missing required status", eventType: "response.output_item.done", itemTypes: []string{"message"}},
+		{name: "done null status", eventType: "response.output_item.done", includeStatus: true, itemTypes: allItemTypes},
+		{name: "done in progress status", eventType: "response.output_item.done", status: "in_progress", includeStatus: true, itemTypes: allItemTypes},
+	}
+
+	for _, lifecycle := range lifecycleTests {
+		for _, itemType := range lifecycle.itemTypes {
+			t.Run(itemType+"/"+lifecycle.name, func(t *testing.T) {
+				itemID := "item_status_" + itemType
+				events := []map[string]any{openAIEventsTestCreated("resp_item_status", 0)}
+				sequence := int64(1)
+				if lifecycle.eventType == "response.output_item.done" {
+					events = append(events, openAIEventsTestItemEvent(
+						"response.output_item.added",
+						openAIEventsTestItem(itemType, itemID, "in_progress", true),
+						0,
+						sequence,
+					))
+					sequence++
+				}
+				events = append(events, openAIEventsTestItemEvent(
+					lifecycle.eventType,
+					openAIEventsTestItem(itemType, itemID, lifecycle.status, lifecycle.includeStatus),
+					0,
+					sequence,
+				))
+
+				response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+				if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+					t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
+				}
+				for _, chunk := range chunks {
+					if chunk.Type == ModelStreamResponseDone {
+						t.Fatalf("invalid item lifecycle emitted response_done: %+v", chunks)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestOpenAIStreamAcceptsOptionalReasoningAndFunctionStatuses(t *testing.T) {
+	tests := []struct {
+		name                   string
+		addedStatus            any
+		includeAddedStatus     bool
+		doneStatus             any
+		includeDoneStatus      bool
+		completedStatus        any
+		includeCompletedStatus bool
+	}{
+		{name: "all omitted"},
+		{name: "done only", doneStatus: "completed", includeDoneStatus: true},
+		{
+			name: "added and completed only", addedStatus: "in_progress", includeAddedStatus: true,
+			completedStatus: "completed", includeCompletedStatus: true,
+		},
+	}
+	for _, itemType := range []string{"reasoning", "function_call"} {
+		for _, test := range tests {
+			t.Run(itemType+"/"+test.name, func(t *testing.T) {
+				itemID := "item_optional_status_" + itemType
+				added := openAIEventsTestItem(itemType, itemID, test.addedStatus, test.includeAddedStatus)
+				done := openAIEventsTestItem(itemType, itemID, test.doneStatus, test.includeDoneStatus)
+				completedItem := openAIEventsTestItem(itemType, itemID, test.completedStatus, test.includeCompletedStatus)
+				completed := openAIEventsTestResponse("resp_optional_status", "test-model", "completed")
+				completed["output"] = []any{completedItem}
+				events := []map[string]any{
+					openAIEventsTestCreated("resp_optional_status", 0),
+					openAIEventsTestItemEvent("response.output_item.added", added, 0, 1),
+				}
+				sequence := int64(2)
+				if itemType == "function_call" {
+					events = append(events, map[string]any{
+						"type": "response.function_call_arguments.done", "sequence_number": sequence,
+						"item_id": itemID, "output_index": int64(0), "name": "echo", "arguments": "{}",
+					})
+					sequence++
+				}
+				events = append(events,
+					openAIEventsTestItemEvent("response.output_item.done", done, 0, sequence),
+					map[string]any{"type": "response.completed", "sequence_number": sequence + 1, "response": completed},
+				)
+
+				response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+				if err != nil || response == nil || response.ID != "resp_optional_status" || len(response.Items) != 1 {
+					t.Fatalf("Complete response=%+v error=%v", response, err)
+				}
+				if response.Items[0].Type != ModelOutputItemType(itemType) {
+					t.Fatalf("response item=%+v, want type %q", response.Items[0], itemType)
+				}
+				rawValue, err := decodeExactJSON(response.Items[0].Raw)
+				if err != nil {
+					t.Fatalf("decode response raw: %v", err)
+				}
+				rawObject, ok := rawValue.(map[string]any)
+				if !ok {
+					t.Fatalf("response raw=%s, want object", response.Items[0].Raw)
+				}
+				rawStatus, hasRawStatus := rawObject["status"]
+				if hasRawStatus != test.includeCompletedStatus || hasRawStatus && rawStatus != test.completedStatus {
+					t.Fatalf("response raw status=%#v present=%t, want provider envelope status=%#v present=%t", rawStatus, hasRawStatus, test.completedStatus, test.includeCompletedStatus)
+				}
+				if itemType == "function_call" && response.Items[0].Call == nil {
+					t.Fatalf("response function call=%+v", response.Items[0])
+				}
+				responseDone := 0
+				for _, chunk := range chunks {
+					if chunk.Type == ModelStreamResponseDone {
+						responseDone++
+					}
+				}
+				if responseDone != 1 {
+					t.Fatalf("response_done=%d chunks=%+v, want one", responseDone, chunks)
+				}
+			})
+		}
+	}
+}
+
+func TestOpenAIStreamIncompleteItemDoneReachesTerminalIncomplete(t *testing.T) {
+	for _, itemType := range []string{"message", "reasoning", "function_call"} {
+		t.Run(itemType, func(t *testing.T) {
+			itemID := "item_incomplete_" + itemType
+			added := openAIEventsTestItem(itemType, itemID, "in_progress", true)
+			done := openAIEventsTestItem(itemType, itemID, "incomplete", true)
+			terminal := openAIEventsTestResponse("resp_incomplete_item", "test-model", "incomplete")
+			terminal["output"] = []any{done}
+			terminal["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+			events := []map[string]any{
+				openAIEventsTestCreated("resp_incomplete_item", 0),
+				openAIEventsTestItemEvent("response.output_item.added", added, 0, 1),
+				openAIEventsTestItemEvent("response.output_item.done", done, 0, 2),
+				{"type": "response.incomplete", "sequence_number": int64(3), "response": terminal},
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+				t.Fatalf("Complete response=%+v error=%v, want terminal incomplete ErrInvalidModelOutput", response, err)
+			}
+			if strings.Contains(err.Error(), "status contradicts") {
+				t.Fatalf("incomplete item was rejected before terminal response: %v", err)
+			}
+			if category, ok := ProviderErrorCategoryOf(err); ok {
+				t.Fatalf("terminal incomplete category=%q, want invalid model output", category)
+			}
+			itemDone := 0
+			for _, chunk := range chunks {
+				switch chunk.Type {
+				case ModelStreamItemDone:
+					itemDone++
+				case ModelStreamResponseDone:
+					t.Fatalf("terminal incomplete emitted response_done: %+v", chunks)
+				}
+			}
+			if itemDone != 1 {
+				t.Fatalf("item_done=%d chunks=%+v, want lifecycle accepted before terminal incomplete", itemDone, chunks)
+			}
+		})
+	}
+}
+
+func TestOpenAICompletedResponseRejectsDoneStatusMismatch(t *testing.T) {
+	for _, itemType := range []string{"message", "reasoning", "function_call"} {
+		t.Run(itemType, func(t *testing.T) {
+			itemID := "item_done_status_mismatch_" + itemType
+			added := openAIEventsTestItem(itemType, itemID, "in_progress", true)
+			done := openAIEventsTestItem(itemType, itemID, "incomplete", true)
+			completedItem := openAIEventsTestItem(itemType, itemID, "completed", true)
+			completed := openAIEventsTestResponse("resp_done_status_mismatch", "test-model", "completed")
+			completed["output"] = []any{completedItem}
+			events := []map[string]any{
+				openAIEventsTestCreated("resp_done_status_mismatch", 0),
+				openAIEventsTestItemEvent("response.output_item.added", added, 0, 1),
+				openAIEventsTestItemEvent("response.output_item.done", done, 0, 2),
+				{"type": "response.completed", "sequence_number": int64(3), "response": completed},
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+				t.Fatalf("Complete response=%+v error=%v, want status mismatch ErrInvalidModelOutput", response, err)
+			}
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("status mismatch emitted response_done: %+v", chunks)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAICompletedResponseRejectsContradictoryItemStatus(t *testing.T) {
+	for _, itemType := range []string{"message", "reasoning", "function_call"} {
+		t.Run(itemType, func(t *testing.T) {
+			itemID := "item_completed_status_" + itemType
+			added := openAIEventsTestItem(itemType, itemID, "in_progress", true)
+			done := openAIEventsTestItem(itemType, itemID, "completed", true)
+			contradictory := openAIEventsTestItem(itemType, itemID, "incomplete", true)
+			completed := openAIEventsTestResponse("resp_completed_status", "test-model", "completed")
+			completed["output"] = []any{contradictory}
+			events := []map[string]any{
+				openAIEventsTestCreated("resp_completed_status", 0),
+				openAIEventsTestItemEvent("response.output_item.added", added, 0, 1),
+				openAIEventsTestItemEvent("response.output_item.done", done, 0, 2),
+				{"type": "response.completed", "sequence_number": int64(3), "response": completed},
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
+				t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
+			}
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("contradictory completed item emitted response_done: %+v", chunks)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAICompletedResponseRejectsUnfinishedAddedItem(t *testing.T) {
+	completed := openAIEventsTestResponse("resp_unfinished_item", "test-model", "completed")
+	events := []map[string]any{
+		openAIEventsTestCreated("resp_unfinished_item", 0),
+		openAIEventsTestItemEvent(
+			"response.output_item.added",
+			openAIEventsTestItem("message", "msg_unfinished", "in_progress", true),
+			0,
+			1,
+		),
+		{"type": "response.completed", "sequence_number": int64(2), "response": completed},
+	}
+
+	response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+	if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "unfinished") {
+		t.Fatalf("Complete response=%+v error=%v, want unfinished-item ErrInvalidModelOutput", response, err)
+	}
+	for _, chunk := range chunks {
+		if chunk.Type == ModelStreamResponseDone {
+			t.Fatalf("unfinished item emitted response_done: %+v", chunks)
+		}
+	}
+}
+
+func TestOpenAIResponseEnvelopeRejectsOmittedImmutableFields(t *testing.T) {
+	for _, field := range []string{"object", "created_at"} {
+		t.Run(field, func(t *testing.T) {
+			completed := openAIEventsTestResponse("resp_omitted_immutable", "test-model", "completed")
+			delete(completed, field)
+			events := []map[string]any{
+				openAIEventsTestCreated("resp_omitted_immutable", 0),
+				{"type": "response.completed", "sequence_number": int64(1), "response": completed},
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "omitted immutable response field") {
+				t.Fatalf("Complete response=%+v error=%v, want omitted immutable field failure", response, err)
+			}
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("omitted immutable field emitted response_done: %+v", chunks)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAIStreamRejectsTextEvidenceAfterTerminalSubevent(t *testing.T) {
+	annotation := map[string]any{
+		"type": "url_citation", "start_index": int64(0), "end_index": int64(4),
+		"title": "source", "url": "https://example.test",
+	}
+	for _, test := range []struct {
+		name        string
+		lateEvent   map[string]any
+		annotations []any
+	}{
+		{
+			name: "delta after text done",
+			lateEvent: map[string]any{
+				"type": "response.output_text.delta", "sequence_number": int64(3),
+				"item_id": "msg_late_text", "output_index": int64(0), "content_index": int64(0),
+				"delta": "safe", "logprobs": []any{},
+			},
+			annotations: []any{},
+		},
+		{
+			name: "annotation after text done",
+			lateEvent: map[string]any{
+				"type": "response.output_text.annotation.added", "sequence_number": int64(3),
+				"item_id": "msg_late_text", "output_index": int64(0), "content_index": int64(0),
+				"annotation_index": int64(0), "annotation": annotation,
+			},
+			annotations: []any{annotation},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			done := openAIEventsTestItem("message", "msg_late_text", "completed", true)
+			done["content"] = []any{map[string]any{
+				"type": "output_text", "text": "safe", "annotations": test.annotations,
+			}}
+			completed := openAIEventsTestResponse("resp_late_text", "test-model", "completed")
+			completed["output"] = []any{done}
+			events := []map[string]any{
+				openAIEventsTestCreated("resp_late_text", 0),
+				openAIEventsTestItemEvent(
+					"response.output_item.added",
+					openAIEventsTestItem("message", "msg_late_text", "in_progress", true),
+					0,
+					1,
+				),
+				{
+					"type": "response.output_text.done", "sequence_number": int64(2),
+					"item_id": "msg_late_text", "output_index": int64(0), "content_index": int64(0),
+					"text": "safe", "logprobs": []any{},
+				},
+				test.lateEvent,
+				openAIEventsTestItemEvent("response.output_item.done", done, 0, 4),
+				{"type": "response.completed", "sequence_number": int64(5), "response": completed},
+			}
+
+			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "after text done") {
+				t.Fatalf("Complete response=%+v error=%v, want closed text lifecycle failure", response, err)
+			}
+			for _, chunk := range chunks {
+				if chunk.Type == ModelStreamResponseDone {
+					t.Fatalf("late text evidence emitted response_done: %+v", chunks)
+				}
+			}
+		})
+	}
+}
+
+func completeOpenAIEventsTestStream(t *testing.T, payload string) (*ModelResponse, error, []ModelStreamEvent) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, payload)
+	}))
+	t.Cleanup(server.Close)
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
+	if err != nil {
+		t.Fatalf("NewOpenAIModel: %v", err)
+	}
+	var chunks []ModelStreamEvent
+	response, completeErr := model.Complete(t.Context(), ModelRequest{
+		Instructions: "Answer.",
+		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
+		StreamSink:   func(event ModelStreamEvent) { chunks = append(chunks, event) },
+	})
+	return response, completeErr, chunks
+}
+
+func openAIEventsTestSSE(events ...map[string]any) string {
+	var stream strings.Builder
+	for _, event := range events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			panic(err)
+		}
+		_, _ = fmt.Fprintf(&stream, "data: %s\n\n", payload)
+	}
+	stream.WriteString("data: [DONE]\n\n")
+	return stream.String()
+}
+
+func openAIEventsTestResponse(id, model, status string) map[string]any {
+	response := map[string]any{
+		"id": id, "object": "response", "created_at": int64(1),
+		"status": status, "output": []any{},
+	}
+	if model != "" {
+		response["model"] = model
+	}
+	return response
+}
+
+func openAIEventsTestCreated(responseID string, sequence int64) map[string]any {
+	return map[string]any{
+		"type": "response.created", "sequence_number": sequence,
+		"response": openAIEventsTestResponse(responseID, "test-model", "in_progress"),
+	}
+}
+
+func openAIEventsTestItemEvent(eventType string, item map[string]any, outputIndex, sequence int64) map[string]any {
+	return map[string]any{
+		"type": eventType, "sequence_number": sequence,
+		"output_index": outputIndex, "item": item,
+	}
+}
+
+func openAIEventsTestItem(itemType, itemID string, status any, includeStatus bool) map[string]any {
+	item := map[string]any{"id": itemID, "type": itemType}
+	if includeStatus {
+		item["status"] = status
+	}
+	switch itemType {
+	case "message":
+		item["role"] = "assistant"
+		item["content"] = []any{}
+	case "reasoning":
+		item["summary"] = []any{}
+	case "function_call":
+		item["call_id"] = "call_status"
+		item["name"] = "echo"
+		item["arguments"] = "{}"
+	default:
+		panic("unsupported OpenAI events test item type: " + itemType)
+	}
+	return item
 }
 
 func TestPublicEventJSONOmitsProviderRaw(t *testing.T) {

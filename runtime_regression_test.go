@@ -182,7 +182,7 @@ func TestRuntimeRejectsSessionRevisionOverflowBeforeModelCall(t *testing.T) {
 	const sessionID = "maximum-revision-session"
 	maximumRevision := ^uint64(0)
 	store := &recordingStore{sessions: map[string]SessionState{
-		sessionID: {ID: sessionID, Revision: maximumRevision},
+		sessionID: {ID: sessionID, ModelBindingID: defaultTestModelBindingID(), Revision: maximumRevision},
 	}}
 	model := &scriptedModel{responses: []*ModelResponse{messageResponse("unexpected-response", "done")}}
 	runtime := newTestRuntime(t, model, nil, nil, nil, nil, nil, store)

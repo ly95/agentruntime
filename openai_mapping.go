@@ -241,9 +241,36 @@ func validateOpenAIResponseEnvelope(raw *responses.Response) error {
 			return fmt.Errorf("%w: OpenAI response repeats output item id %q", ErrInvalidModelOutput, item.ID)
 		}
 		seenItemIDs[item.ID] = struct{}{}
-		if item.Status != string(responses.ResponseStatusCompleted) {
-			return fmt.Errorf("%w: OpenAI output item %q has unsupported status %q", ErrInvalidModelOutput, item.ID, item.Status)
+		if err := validateOpenAICompletedOutputItemStatus(item); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func validateOpenAICompletedOutputItemStatus(item responses.ResponseOutputItemUnion) error {
+	status := ""
+	present := false
+	required := false
+	switch item.Type {
+	case string(ModelOutputMessage):
+		message := item.AsMessage()
+		status = string(message.Status)
+		present = message.JSON.Status.Valid()
+		required = true
+	case string(ModelOutputReasoning):
+		reasoning := item.AsReasoning()
+		status = string(reasoning.Status)
+		present = reasoning.JSON.Status.Valid()
+	case string(ModelOutputFunctionCall):
+		call := item.AsFunctionCall()
+		status = string(call.Status)
+		present = call.JSON.Status.Valid()
+	default:
+		return nil
+	}
+	if required && !present || present && status != string(responses.ResponseStatusCompleted) {
+		return fmt.Errorf("%w: OpenAI output item %q has unsupported status %q", ErrInvalidModelOutput, item.ID, status)
 	}
 	return nil
 }
@@ -288,7 +315,7 @@ func parseOpenAIFunctionCall(
 			itemID,
 		)
 	}
-	if call.Status != responses.ResponseFunctionToolCallStatusCompleted {
+	if call.JSON.Status.Valid() && call.Status != responses.ResponseFunctionToolCallStatusCompleted {
 		return nil, nil, fmt.Errorf(
 			"%w: OpenAI function call %q cannot use finalized stream arguments with status %q",
 			ErrInvalidModelOutput,

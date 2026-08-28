@@ -793,14 +793,14 @@ func (s *sanitizingBoundaryStore) assertInput(boundary string, input Input) {
 	}
 }
 
-func (s *sanitizingBoundaryStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+func (s *sanitizingBoundaryStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
 	s.assertInput("CreateRun", request.Run.Input)
-	return s.recordingStore.CreateRunV3(ctx, request, accept)
+	return s.recordingStore.CreateRunV4(ctx, request, accept)
 }
 
-func (s *sanitizingBoundaryStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+func (s *sanitizingBoundaryStore) ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
 	s.assertInput("ResumeRun", request.Run.Input)
-	return s.recordingStore.ResumeRunV3(ctx, request, accept)
+	return s.recordingStore.ResumeRunV4(ctx, request, accept)
 }
 
 func (s *sanitizingBoundaryStore) FinishRun(ctx context.Context, request FinishRunRequest) error {
@@ -1093,7 +1093,7 @@ func TestRuntimeRejectsPendingApprovalWithoutDurableRunStore(t *testing.T) {
 func TestLegacyOperationBindingFailureTerminalizesAndReleasesLease(t *testing.T) {
 	const sessionID = "legacy-failure-session"
 	store := &recordingStore{sessions: map[string]SessionState{
-		sessionID: {ID: sessionID, Revision: 0, CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
+		sessionID: {ID: sessionID, ModelBindingID: defaultTestModelBindingID(), Revision: 0, CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
 	}}
 	ops := NewOperationRegistry()
 	if err := ops.Register(operation("read_context", OperationEffectRead)); err != nil {
@@ -1873,7 +1873,7 @@ func TestSessionReloadPrunesSavedCallIDSuperset(t *testing.T) {
 	}), nil, nil, &recordingStore{})
 	now := time.Now()
 	session := &SessionState{
-		ID: "seen-session", OperationSetID: runtime.operationSetID, Revision: 3,
+		ID: "seen-session", ModelBindingID: runtime.modelBindingID, OperationSetID: runtime.operationSetID, Revision: 3,
 		Transcript: []ModelInputItem{
 			{Type: ModelInputUserMessage, Text: "retained user turn"},
 			{Type: ModelInputAssistantOutput, OutputType: ModelOutputFunctionCall, CallID: "call-retained", Raw: json.RawMessage(`{"id":"item-retained"}`)},
@@ -1931,18 +1931,25 @@ func TestRuntimeRejectsMissingBeginRunOperationBinding(t *testing.T) {
 
 func TestRunStoreRejectsExpiredActiveRunOperationSetRewrite(t *testing.T) {
 	now := time.Now()
+	modelBindingID := defaultTestModelBindingID()
 	store := &recordingStore{
-		now:      func() time.Time { return now },
-		runs:     []RunRecord{{ID: "active-run", SessionID: "binding-session", OperationSetID: "set-a", Status: RunStatusRunning}},
-		sessions: map[string]SessionState{"binding-session": {ID: "binding-session"}},
+		now: func() time.Time { return now },
+		runs: []RunRecord{{
+			ID: "active-run", SessionID: "binding-session", ModelBindingID: modelBindingID,
+			OperationSetID: "set-a", Status: RunStatusRunning,
+		}},
+		sessions: map[string]SessionState{"binding-session": {ID: "binding-session", ModelBindingID: modelBindingID}},
 		leases: map[string]RunHandle{"binding-session": {
 			RunID: "active-run", SessionID: "binding-session", LeaseID: "old-lease",
 			LeaseGeneration: 1, LeaseDeadline: now.Add(-time.Minute),
 		}},
 		leaseGenerations: map[string]uint64{"binding-session": 1},
 	}
-	err := store.CreateRunV3(context.Background(), CreateRunRequest{
-		Run:     RunRecord{ID: "new-run", SessionID: "binding-session", OperationSetID: "set-b", Status: RunStatusRunning},
+	err := store.CreateRunV4(context.Background(), CreateRunRequest{
+		Run: RunRecord{
+			ID: "new-run", SessionID: "binding-session", ModelBindingID: modelBindingID,
+			OperationSetID: "set-b", Status: RunStatusRunning,
+		},
 		LeaseID: "new-lease", LeaseTTL: time.Minute,
 	}, func(RunStart) error { return nil })
 	if !errors.Is(err, ErrOperationPlanChanged) {
@@ -2360,7 +2367,7 @@ func TestLegacyUnboundSessionRejectsWritesBeforeAuthorizationOrPlanning(t *testi
 		t.Run(test.name, func(t *testing.T) {
 			sessionID := "legacy-" + test.name
 			store := &recordingStore{sessions: map[string]SessionState{
-				sessionID: {ID: sessionID, CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
+				sessionID: {ID: sessionID, ModelBindingID: defaultTestModelBindingID(), CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
 			}}
 			op := operation("apply_change", OperationEffectWrite)
 			if !test.approval {
@@ -2421,7 +2428,7 @@ func TestLegacyUnboundSessionRejectsWritesBeforeAuthorizationOrPlanning(t *testi
 func TestLegacySessionCanBindThroughWriteFreeRunBeforeWriting(t *testing.T) {
 	const sessionID = "legacy-migration"
 	store := &recordingStore{sessions: map[string]SessionState{
-		sessionID: {ID: sessionID, CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
+		sessionID: {ID: sessionID, ModelBindingID: defaultTestModelBindingID(), CreatedAt: time.Unix(1, 0), UpdatedAt: time.Unix(1, 0)},
 	}}
 	op := operation("apply_change", OperationEffectWrite)
 	op.Confirmation = ConfirmationSpec{Mode: ConfirmationNone}
@@ -4063,7 +4070,7 @@ func TestRuntimeRejectsResponseIdentityViolationsBeforeAuditOrWrite(t *testing.T
 	}
 }
 
-func TestRuntimeResponseIdentityLedgerCoversLegacyAndCorrectiveResponses(t *testing.T) {
+func TestRuntimeResponseIdentityLedgerCoversLegacyAndMultiTurnResponses(t *testing.T) {
 	countResponseAudits := func(store *recordingStore) int {
 		store.mu.Lock()
 		defer store.mu.Unlock()
@@ -4104,27 +4111,42 @@ func TestRuntimeResponseIdentityLedgerCoversLegacyAndCorrectiveResponses(t *test
 		}
 	})
 
+	const (
+		firstResponseID = "multi-turn-first-response"
+		firstItemID     = "multi-turn-first-response-call-0"
+	)
 	for _, test := range []struct {
 		name             string
 		secondResponseID string
 		secondItemID     string
 	}{
-		{name: "corrective response id", secondResponseID: "corrective-first-response", secondItemID: "corrective-second-item"},
-		{name: "corrective provider item id", secondResponseID: "corrective-second-response", secondItemID: "corrective-first-item"},
+		{name: "multi-turn response id", secondResponseID: firstResponseID, secondItemID: "multi-turn-second-item"},
+		{name: "multi-turn provider item id", secondResponseID: "multi-turn-second-response", secondItemID: firstItemID},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			first := &ModelResponse{
-				ID: "corrective-first-response", HadReasoning: true, FinishReason: "length",
-				Items: []ModelOutputItem{{
-					ID: "corrective-first-item", Type: ModelOutputReasoning,
-					Raw: json.RawMessage(`{"id":"corrective-first-item","type":"reasoning","status":"completed","summary":[]}`),
-				}},
-			}
+			first := callResponse(firstResponseID, ToolCall{
+				ID: "multi-turn-call", Name: "read_context", Input: json.RawMessage(`{}`),
+			})
 			second := messageResponse(test.secondResponseID, "done")
 			second.Items[0].ID = test.secondItemID
 			second.Items[0].Raw = json.RawMessage(fmt.Sprintf(`{"id":%q,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done"}]}`, test.secondItemID))
+			operations := NewOperationRegistry()
+			if err := operations.Register(operation("read_context", OperationEffectRead)); err != nil {
+				t.Fatal(err)
+			}
 			store := &recordingStore{}
-			runtime := newTestRuntime(t, &scriptedModel{responses: []*ModelResponse{first, second}}, nil, nil, nil, nil, nil, store)
+			runtime := newTestRuntime(
+				t,
+				&scriptedModel{responses: []*ModelResponse{first, second}},
+				operations,
+				allowPolicy(),
+				OperationExecutorFunc(func(context.Context, OperationRequest) (OperationResult, error) {
+					return OperationResult{Output: json.RawMessage(`{}`)}, nil
+				}),
+				nil,
+				nil,
+				store,
+			)
 			_, err := runtime.Run(t.Context(), Input{User: "answer"})
 			if !errors.Is(err, ErrInvalidModelOutput) || countResponseAudits(store) != 1 {
 				t.Fatalf("Run error=%v response audits=%d", err, countResponseAudits(store))

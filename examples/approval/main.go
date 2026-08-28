@@ -45,6 +45,13 @@ type scriptedModel struct {
 	responses []*agentruntime.ModelResponse
 }
 
+func (*scriptedModel) Binding() agentruntime.ModelBinding {
+	return agentruntime.ModelBinding{
+		Provider: "example", Model: "scripted", EndpointClass: "process-local",
+		CredentialPrincipal: "approval-example", AdapterVersion: "v1",
+	}
+}
+
 func (model *scriptedModel) Complete(context.Context, agentruntime.ModelRequest) (*agentruntime.ModelResponse, error) {
 	model.mu.Lock()
 	defer model.mu.Unlock()

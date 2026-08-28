@@ -164,7 +164,7 @@ func validateOpenAIResponseError(raw json.RawMessage, label string) error {
 		return err
 	}
 	if !validOpenAIResponseErrorCode(code) {
-		return fmt.Errorf("%w: OpenAI %s.code %q is unsupported", ErrInvalidModelOutput, label, code)
+		return fmt.Errorf("%w: OpenAI %s.code is unsupported", ErrInvalidModelOutput, label)
 	}
 	messageRaw, present := fields["message"]
 	if !present || !openAINonNullRaw(messageRaw) {
@@ -213,7 +213,7 @@ func validateOpenAIResponseIncompleteDetails(raw json.RawMessage, label string) 
 		return err
 	}
 	if !openAIStringInSet(reason, "max_output_tokens", "content_filter") {
-		return fmt.Errorf("%w: OpenAI %s.reason %q is unsupported", ErrInvalidModelOutput, label, reason)
+		return fmt.Errorf("%w: OpenAI %s.reason is unsupported", ErrInvalidModelOutput, label)
 	}
 	return nil
 }

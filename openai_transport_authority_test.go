@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -42,7 +43,7 @@ func TestOpenAIModelRejectsUnknownStreamAuthorityFields(t *testing.T) {
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
@@ -55,41 +56,55 @@ func TestOpenAIModelRejectsUnknownStreamAuthorityFields(t *testing.T) {
 }
 
 func TestOpenAIModelRejectsMalformedTerminalAuthority(t *testing.T) {
+	const (
+		createdFailed     = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n"
+		createdIncomplete = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_incomplete\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"in_progress\",\"output\":[]},\"sequence_number\":0}\n\n"
+		done              = "data: [DONE]\n\n"
+	)
 	tests := []struct {
 		name   string
 		events string
+		want   string
 	}{
 		{
 			name:   "failed missing error",
-			events: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdFailed + "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"failed\",\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "failed is missing its error",
 		},
 		{
 			name:   "failed missing error message",
-			events: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\"},\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdFailed + "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\"},\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "is missing its message",
 		},
 		{
 			name:   "failed unsupported error code",
-			events: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"future_error\",\"message\":\"boom\"},\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdFailed + "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"failed\",\"error\":{\"code\":\"future_error\",\"message\":\"boom\"},\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "error.code is unsupported",
 		},
 		{
 			name:   "failed empty error message",
-			events: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"\"},\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdFailed + "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"\"},\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "message must not be empty",
 		},
 		{
 			name:   "incomplete missing details",
-			events: "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdIncomplete + "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"incomplete\",\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "incomplete is missing its incomplete_details",
 		},
 		{
 			name:   "incomplete unsupported reason",
-			events: "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"future_reason\"},\"output\":[]},\"sequence_number\":0}\n\n",
+			events: createdIncomplete + "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"object\":\"response\",\"created_at\":1,\"model\":\"test-model\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"future_reason\"},\"output\":[]},\"sequence_number\":1}\n\n" + done,
+			want:   "incomplete_details.reason is unsupported",
 		},
 		{
 			name:   "error event missing param",
-			events: "data: {\"type\":\"error\",\"code\":\"bad_request\",\"message\":\"boom\",\"sequence_number\":0}\n\n",
+			events: "data: {\"type\":\"error\",\"code\":\"bad_request\",\"message\":\"boom\",\"sequence_number\":0}\n\n" + done,
+			want:   "param",
 		},
 		{
 			name:   "error event null param",
-			events: "data: {\"type\":\"error\",\"code\":\"bad_request\",\"message\":\"boom\",\"param\":null,\"sequence_number\":0}\n\n",
+			events: "data: {\"type\":\"error\",\"code\":\"bad_request\",\"message\":\"boom\",\"param\":null,\"sequence_number\":0}\n\n" + done,
+			want:   "param",
 		},
 	}
 	for _, test := range tests {
@@ -99,13 +114,13 @@ func TestOpenAIModelRejectsMalformedTerminalAuthority(t *testing.T) {
 				fmt.Fprint(w, test.events)
 			}))
 			defer server.Close()
-			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+			model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 			if err != nil {
 				t.Fatalf("NewOpenAIModel: %v", err)
 			}
 			_, err = model.Complete(t.Context(), ModelRequest{Instructions: "Answer the user.", Input: []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}}})
-			if !errors.Is(err, ErrInvalidModelOutput) {
-				t.Fatalf("Complete error=%v, want ErrInvalidModelOutput", err)
+			if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Complete error=%v, want ErrInvalidModelOutput containing %q", err, test.want)
 			}
 		})
 	}
@@ -121,7 +136,7 @@ func TestOpenAIModelAcceptsTypedImmutableResponseFieldsAndNullableNulls(t *testi
 		fmt.Fprint(w, events)
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -143,7 +158,7 @@ func TestOpenAIModelAcceptsCanonicalTerminalAccounting(t *testing.T) {
 		fmt.Fprint(w, events)
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -166,7 +181,7 @@ func TestOpenAIModelAcceptsTypedImmutableToolChoiceAndTools(t *testing.T) {
 		fmt.Fprint(w, events)
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -185,7 +200,7 @@ func TestOpenAIModelAcceptsStructuredInstructionsAndPromptVariables(t *testing.T
 		fmt.Fprint(w, events)
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}
@@ -218,7 +233,7 @@ func TestOpenAIModelAcceptsFullyTypedNestedImmutableUnions(t *testing.T) {
 		fmt.Fprint(w, events)
 	}))
 	defer server.Close()
-	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), OpenAIModelConfig{Model: "test-model"})
+	model, err := NewOpenAIModel(newOpenAITestClient(server.URL+"/v1"), openAITestModelConfig("test-model"))
 	if err != nil {
 		t.Fatalf("NewOpenAIModel: %v", err)
 	}

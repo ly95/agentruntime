@@ -33,8 +33,11 @@ func (s *recordingStore) currentTime() time.Time {
 }
 
 func createRunForTest(ctx context.Context, store RunStore, request CreateRunRequest) (RunStart, error) {
+	if request.Run.ModelBindingID == "" {
+		request.Run.ModelBindingID = defaultTestModelBindingID()
+	}
 	var started RunStart
-	err := store.CreateRunV3(ctx, request, func(candidate RunStart) error {
+	err := store.CreateRunV4(ctx, request, func(candidate RunStart) error {
 		started = candidate
 		return nil
 	})
@@ -73,12 +76,12 @@ type corruptingCreateStartAdapter struct {
 	corrupt func(*RunStart)
 }
 
-func (s *corruptingCreateStartAdapter) CreateRunV3(
+func (s *corruptingCreateStartAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
 ) error {
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		if s.corrupt != nil {
 			s.corrupt(&start)
 		}
@@ -123,28 +126,28 @@ func concurrentAcceptanceErrors[T any](candidate T, accept func(T) error) error 
 	return errors.Join(first, second)
 }
 
-func (s *concurrentStartAcceptanceAdapter) CreateRunV3(
+func (s *concurrentStartAcceptanceAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
 ) error {
 	if !s.concurrentCreate {
-		return s.recordingStore.CreateRunV3(ctx, request, accept)
+		return s.recordingStore.CreateRunV4(ctx, request, accept)
 	}
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		return concurrentAcceptanceErrors(start, func(candidate RunStart) error { return accept(candidate) })
 	})
 }
 
-func (s *concurrentStartAcceptanceAdapter) ResumeRunV3(
+func (s *concurrentStartAcceptanceAdapter) ResumeRunV4(
 	ctx context.Context,
 	request ResumeRunRequest,
 	accept AcceptResumedRun,
 ) error {
 	if !s.concurrentResume {
-		return s.recordingStore.ResumeRunV3(ctx, request, accept)
+		return s.recordingStore.ResumeRunV4(ctx, request, accept)
 	}
-	return s.recordingStore.ResumeRunV3(ctx, request, func(resumed ResumedRun) error {
+	return s.recordingStore.ResumeRunV4(ctx, request, func(resumed ResumedRun) error {
 		return concurrentAcceptanceErrors(resumed, func(candidate ResumedRun) error { return accept(candidate) })
 	})
 }
@@ -154,12 +157,12 @@ type delayingCreateAcceptanceAdapter struct {
 	delay time.Duration
 }
 
-func (s *delayingCreateAcceptanceAdapter) CreateRunV3(
+func (s *delayingCreateAcceptanceAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
 ) error {
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		timer := time.NewTimer(s.delay)
 		defer timer.Stop()
 		select {
@@ -176,12 +179,12 @@ type delayingCreateReturnAdapter struct {
 	delay time.Duration
 }
 
-func (s *delayingCreateReturnAdapter) CreateRunV3(
+func (s *delayingCreateReturnAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
 ) error {
-	err := s.recordingStore.CreateRunV3(ctx, request, accept)
+	err := s.recordingStore.CreateRunV4(ctx, request, accept)
 	if err != nil {
 		return err
 	}
@@ -209,7 +212,7 @@ func newLateResumeFallbackAdapter(store *recordingStore) *lateResumeFallbackAdap
 	}
 }
 
-func (s *lateResumeFallbackAdapter) ResumeRunV3(
+func (s *lateResumeFallbackAdapter) ResumeRunV4(
 	_ context.Context,
 	_ ResumeRunRequest,
 	accept AcceptResumedRun,
@@ -221,7 +224,7 @@ func (s *lateResumeFallbackAdapter) ResumeRunV3(
 	return ErrRunNotFound
 }
 
-func (s *lateResumeFallbackAdapter) CreateRunV3(
+func (s *lateResumeFallbackAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
@@ -230,7 +233,7 @@ func (s *lateResumeFallbackAdapter) CreateRunV3(
 	if err := <-s.callbackDone; !errors.Is(err, ErrOperationPlanChanged) {
 		return fmt.Errorf("late resume callback error=%v", err)
 	}
-	return s.recordingStore.CreateRunV3(ctx, request, accept)
+	return s.recordingStore.CreateRunV4(ctx, request, accept)
 }
 
 type ambiguousResumeStore struct {
@@ -245,16 +248,16 @@ func (customRunNotFoundError) Error() string { return "custom run absence" }
 
 func (customRunNotFoundError) Is(target error) bool { return target == ErrRunNotFound }
 
-func (s *ambiguousResumeStore) ResumeRunV3(context.Context, ResumeRunRequest, AcceptResumedRun) error {
+func (s *ambiguousResumeStore) ResumeRunV4(context.Context, ResumeRunRequest, AcceptResumedRun) error {
 	return s.err
 }
 
-func (s *ambiguousResumeStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+func (s *ambiguousResumeStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
 	s.createCalls++
-	return s.recordingStore.CreateRunV3(ctx, request, accept)
+	return s.recordingStore.CreateRunV4(ctx, request, accept)
 }
 
-func (s *retryingStartAcceptanceAdapter) CreateRunV3(
+func (s *retryingStartAcceptanceAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
@@ -262,10 +265,10 @@ func (s *retryingStartAcceptanceAdapter) CreateRunV3(
 	if s.retryCreate {
 		_ = accept(RunStart{Handle: RunHandle{RunID: "wrong-run", SessionID: request.Run.SessionID}})
 	}
-	return s.recordingStore.CreateRunV3(ctx, request, accept)
+	return s.recordingStore.CreateRunV4(ctx, request, accept)
 }
 
-func (s *retryingStartAcceptanceAdapter) ResumeRunV3(
+func (s *retryingStartAcceptanceAdapter) ResumeRunV4(
 	ctx context.Context,
 	request ResumeRunRequest,
 	accept AcceptResumedRun,
@@ -275,7 +278,7 @@ func (s *retryingStartAcceptanceAdapter) ResumeRunV3(
 			RunStart: RunStart{Handle: RunHandle{RunID: request.Run.ID, SessionID: request.Run.SessionID}},
 		})
 	}
-	return s.recordingStore.ResumeRunV3(ctx, request, accept)
+	return s.recordingStore.ResumeRunV4(ctx, request, accept)
 }
 
 type cancelingStartAcceptanceAdapter struct {
@@ -286,12 +289,12 @@ type cancelingStartAcceptanceAdapter struct {
 	cancelResumeAfter bool
 }
 
-func (s *cancelingStartAcceptanceAdapter) CreateRunV3(
+func (s *cancelingStartAcceptanceAdapter) CreateRunV4(
 	ctx context.Context,
 	request CreateRunRequest,
 	accept AcceptRunStart,
 ) error {
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		if s.cancelCreate != nil && !s.cancelCreateAfter {
 			s.cancelCreate()
 		}
@@ -303,12 +306,12 @@ func (s *cancelingStartAcceptanceAdapter) CreateRunV3(
 	})
 }
 
-func (s *cancelingStartAcceptanceAdapter) ResumeRunV3(
+func (s *cancelingStartAcceptanceAdapter) ResumeRunV4(
 	ctx context.Context,
 	request ResumeRunRequest,
 	accept AcceptResumedRun,
 ) error {
-	return s.recordingStore.ResumeRunV3(ctx, request, func(resumed ResumedRun) error {
+	return s.recordingStore.ResumeRunV4(ctx, request, func(resumed ResumedRun) error {
 		if s.cancelResume != nil && !s.cancelResumeAfter {
 			s.cancelResume()
 		}
@@ -320,12 +323,12 @@ func (s *cancelingStartAcceptanceAdapter) ResumeRunV3(
 	})
 }
 
-func (s *corruptingResumeStartAdapter) ResumeRunV3(
+func (s *corruptingResumeStartAdapter) ResumeRunV4(
 	ctx context.Context,
 	request ResumeRunRequest,
 	accept AcceptResumedRun,
 ) error {
-	return s.recordingStore.ResumeRunV3(ctx, request, func(resumed ResumedRun) error {
+	return s.recordingStore.ResumeRunV4(ctx, request, func(resumed ResumedRun) error {
 		if s.corrupt != nil {
 			s.corrupt(&resumed)
 		}
@@ -333,8 +336,8 @@ func (s *corruptingResumeStartAdapter) ResumeRunV3(
 	})
 }
 
-// legacyBeginRunAdapter deliberately exposes the pre-V3 method name. Its
-// embedded V3 implementation remains the method selected by RunStore, proving
+// legacyBeginRunAdapter deliberately exposes the pre-V4 method name. Its
+// embedded V4 implementation remains the method selected by RunStore, proving
 // an old BeginRunV2 override cannot silently intercept the split boundary.
 type legacyBeginRunAdapter struct {
 	*recordingStore
@@ -355,7 +358,7 @@ type invalidPrecommitStartStore struct {
 	ignoreCallbackError bool
 }
 
-func (s *invalidPrecommitStartStore) CreateRunV3(_ context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+func (s *invalidPrecommitStartStore) CreateRunV4(_ context.Context, request CreateRunRequest, accept AcceptRunStart) error {
 	if s.omit {
 		return nil
 	}
@@ -373,7 +376,7 @@ func (s *invalidPrecommitStartStore) CreateRunV3(_ context.Context, request Crea
 	return err
 }
 
-func (s *invalidPrecommitStartStore) ResumeRunV3(_ context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+func (s *invalidPrecommitStartStore) ResumeRunV4(_ context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
 	if !s.resume {
 		return ErrRunNotFound
 	}
@@ -666,7 +669,7 @@ func (s *mutatingAppendStore) AppendItem(ctx context.Context, item ItemRecord) e
 	return s.recordingStore.AppendItem(ctx, item)
 }
 
-func (s *mutatingBeginStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+func (s *mutatingBeginStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
 	stored, err := clonePersistentRunRecord(request.Run)
 	if err != nil {
 		return err
@@ -675,10 +678,10 @@ func (s *mutatingBeginStore) CreateRunV3(ctx context.Context, request CreateRunR
 		nested["value"] = "store-mutated"
 	}
 	request.Run = stored
-	return s.recordingStore.CreateRunV3(ctx, request, accept)
+	return s.recordingStore.CreateRunV4(ctx, request, accept)
 }
 
-func (s *mutatingBeginStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+func (s *mutatingBeginStore) ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
 	stored, err := clonePersistentRunRecord(request.Run)
 	if err != nil {
 		return err
@@ -687,32 +690,32 @@ func (s *mutatingBeginStore) ResumeRunV3(ctx context.Context, request ResumeRunR
 		nested["value"] = "store-mutated"
 	}
 	request.Run = stored
-	return s.recordingStore.ResumeRunV3(ctx, request, accept)
+	return s.recordingStore.ResumeRunV4(ctx, request, accept)
 }
 
-func (s *mismatchedRunHandleStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+func (s *mismatchedRunHandleStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		start.Handle.RunID = "run-other"
 		return accept(start)
 	})
 }
 
-func (s *mismatchedRunHandleStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
-	return s.recordingStore.ResumeRunV3(ctx, request, func(resumed ResumedRun) error {
+func (s *mismatchedRunHandleStore) ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+	return s.recordingStore.ResumeRunV4(ctx, request, func(resumed ResumedRun) error {
 		resumed.Handle.RunID = "run-other"
 		return accept(resumed)
 	})
 }
 
-func (s *hiddenBeginSessionStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
-	return s.recordingStore.CreateRunV3(ctx, request, func(start RunStart) error {
+func (s *hiddenBeginSessionStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+	return s.recordingStore.CreateRunV4(ctx, request, func(start RunStart) error {
 		start.Session = nil
 		return accept(start)
 	})
 }
 
-func (s *hiddenBeginSessionStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
-	return s.recordingStore.ResumeRunV3(ctx, request, func(resumed ResumedRun) error {
+func (s *hiddenBeginSessionStore) ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+	return s.recordingStore.ResumeRunV4(ctx, request, func(resumed ResumedRun) error {
 		resumed.Session = nil
 		return accept(resumed)
 	})

@@ -109,6 +109,8 @@ type runtimeIdentityScopeContextKey struct{}
 
 type Runtime struct {
 	model                   Model
+	modelBinding            ModelBinding
+	modelBindingID          string
 	operations              *OperationRegistry
 	executor                OperationExecutor
 	policy                  OperationPolicy
@@ -379,6 +381,15 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err := validateRuntimeDependencies(cfg); err != nil {
 		return nil, err
 	}
+	var modelBinding ModelBinding
+	var modelBindingID string
+	if cfg.RunStore != nil {
+		var err error
+		modelBinding, modelBindingID, err = boundModelBinding(cfg.Model)
+		if err != nil {
+			return nil, err
+		}
+	}
 	settings, err := normalizeRuntimeSettings(cfg)
 	if err != nil {
 		return nil, err
@@ -389,6 +400,8 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	}
 	runtime := &Runtime{
 		model:                   cfg.Model,
+		modelBinding:            modelBinding,
+		modelBindingID:          modelBindingID,
 		operations:              catalog.operations,
 		executor:                catalog.executor,
 		policy:                  cfg.Policy,

@@ -98,7 +98,9 @@ func newOpenAIModel() (*agentruntime.OpenAIModel, error) {
 		option.WithMaxRetries(2),
 	)
 	model, err := agentruntime.NewOpenAIModel(client, agentruntime.OpenAIModelConfig{
-		Model: os.Getenv("OPENAI_MODEL"),
+		Model:               os.Getenv("OPENAI_MODEL"),
+		EndpointClass:       os.Getenv("OPENAI_ENDPOINT_CLASS"),
+		CredentialPrincipal: os.Getenv("OPENAI_CREDENTIAL_PRINCIPAL"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create OpenAI model: %w", err)

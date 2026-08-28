@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
 
-func (store *InMemoryStore) CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
+func (store *InMemoryStore) CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
@@ -18,7 +19,7 @@ func (store *InMemoryStore) CreateRunV3(ctx context.Context, request CreateRunRe
 	}, false, accept, nil)
 }
 
-func (store *InMemoryStore) ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
+func (store *InMemoryStore) ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
@@ -62,6 +63,9 @@ func (store *InMemoryStore) beginRun(
 		if existingRun.Status != RunStatusWaitingUser {
 			return fmt.Errorf("%w: run id %q is not waiting", ErrIdentityConflict, request.Run.ID)
 		}
+		if existingRun.ModelBindingID != request.Run.ModelBindingID {
+			return fmt.Errorf("%w: waiting run %s", ErrModelBindingMismatch, request.Run.ID)
+		}
 		if existingRun.SkillSetID != request.Run.SkillSetID {
 			return fmt.Errorf("%w: waiting run %s", ErrSkillSetMismatch, request.Run.ID)
 		}
@@ -93,21 +97,32 @@ func (store *InMemoryStore) beginRun(
 		if !ok || pending.Digest != pendingDigest {
 			return fmt.Errorf("%w: waiting run %s has no matching pending approval", ErrOperationPlanChanged, request.Run.ID)
 		}
-		if pending.Request.Checkpoint == nil || request.InputDigest != pending.Request.Checkpoint.InputDigest {
+		if err := validatePendingApprovalCommitAuthority(
+			pending, request.Run.ModelBindingID, fmt.Sprintf("waiting run %s", request.Run.ID),
+		); err != nil {
+			return err
+		}
+		checkpoint := pending.Request.Checkpoint
+		if request.InputDigest != checkpoint.InputDigest {
 			return fmt.Errorf("%w: waiting run %s input changed", ErrOperationPlanChanged, request.Run.ID)
 		}
 		if pending.Request.Operation.SessionID != request.Run.SessionID {
 			return fmt.Errorf("%w: waiting run %s approval session changed", ErrOperationPlanChanged, request.Run.ID)
 		}
+		if request.Run.SessionID != "" {
+			if _, exists := store.sessions[request.Run.SessionID]; !exists {
+				return fmt.Errorf("%w: waiting run %s has no durable session state", ErrSessionNotFound, request.Run.ID)
+			}
+		}
 		currentRevision := uint64(0)
 		if session, exists := store.sessions[request.Run.SessionID]; request.Run.SessionID != "" && exists {
 			currentRevision = session.Revision
 		}
-		if pending.Request.Checkpoint.ExpectedSessionRevision != currentRevision {
+		if checkpoint.ExpectedSessionRevision != currentRevision {
 			return fmt.Errorf(
 				"%w: waiting run %s expects session revision %d, current revision is %d",
 				ErrOperationPlanChanged, request.Run.ID,
-				pending.Request.Checkpoint.ExpectedSessionRevision, currentRevision,
+				checkpoint.ExpectedSessionRevision, currentRevision,
 			)
 		}
 		cloned, cloneErr := cloneStoredPendingApproval(pending)
@@ -124,6 +139,12 @@ func (store *InMemoryStore) beginRun(
 	now := store.currentTime()
 	if request.Run.SessionID != "" {
 		existingSession, sessionExists := store.sessions[request.Run.SessionID]
+		if !sessionExists && store.sessionHasStoredRunLocked(request.Run.SessionID) {
+			return fmt.Errorf("%w: session %s has run history but no durable session state", ErrSessionNotFound, request.Run.SessionID)
+		}
+		if sessionExists && existingSession.ModelBindingID != request.Run.ModelBindingID {
+			return fmt.Errorf("%w: session %s", ErrModelBindingMismatch, request.Run.SessionID)
+		}
 		if sessionExists && existingSession.SkillSetID != request.Run.SkillSetID {
 			return fmt.Errorf("%w: session %s", ErrSkillSetMismatch, request.Run.SessionID)
 		}
@@ -134,6 +155,14 @@ func (store *InMemoryStore) beginRun(
 			activeRun, ok := store.runs[active.RunID]
 			if !ok {
 				return fmt.Errorf("%w: active run %s is missing", ErrSessionConflict, active.RunID)
+			}
+			if activeRun.ModelBindingID != request.Run.ModelBindingID {
+				return fmt.Errorf("%w: active run %s", ErrModelBindingMismatch, active.RunID)
+			}
+			if err := store.validateStoredRunPendingApprovalAuthorityLocked(
+				activeRun, request.Run.ModelBindingID, fmt.Sprintf("active run %s", active.RunID),
+			); err != nil {
+				return err
 			}
 			if activeRun.SkillSetID != request.Run.SkillSetID {
 				return fmt.Errorf("%w: active run %s", ErrSkillSetMismatch, active.RunID)
@@ -148,17 +177,20 @@ func (store *InMemoryStore) beginRun(
 		}
 
 		handle.LeaseID = request.LeaseID
+		if store.leaseGenerations[request.Run.SessionID] == math.MaxUint64 {
+			return fmt.Errorf("%w: session %q lease generation exhausted", ErrRunStoreProtocol, request.Run.SessionID)
+		}
 		handle.LeaseGeneration = store.leaseGenerations[request.Run.SessionID] + 1
 		handle.LeaseDeadline = now.Add(request.LeaseTTL)
 		if sessionExists {
 			handle.SessionRevision = existingSession.Revision
 			cloned := cloneStoredSessionState(existingSession)
 			session = &cloned
-		} else if request.Run.SkillSetID != "" || request.Run.OperationSetID != "" {
+		} else {
 			binding := SessionState{
-				ID: request.Run.SessionID, SkillSetID: request.Run.SkillSetID,
-				OperationSetID: request.Run.OperationSetID,
-				CreatedAt:      request.Run.CreatedAt, UpdatedAt: request.Run.UpdatedAt,
+				ID: request.Run.SessionID, ModelBindingID: request.Run.ModelBindingID,
+				SkillSetID: request.Run.SkillSetID, OperationSetID: request.Run.OperationSetID,
+				CreatedAt: request.Run.CreatedAt, UpdatedAt: request.Run.UpdatedAt,
 			}
 			session = &binding
 			newBinding = true
@@ -333,7 +365,7 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 	if request.PendingApproval != nil {
 		cloned, cloneErr := cloneStoredPendingApproval(*request.PendingApproval)
 		if cloneErr != nil {
-			return cloneErr
+			return fmt.Errorf("%w: pending approval cannot be cloned: %v", ErrOperationPlanChanged, cloneErr)
 		}
 		request.PendingApproval = &cloned
 	}
@@ -357,6 +389,25 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 	if existingRun.SessionID != run.SessionID {
 		return ErrSessionConflict
 	}
+	if existingRun.ModelBindingID != run.ModelBindingID {
+		return fmt.Errorf("%w: run %s", ErrModelBindingMismatch, run.ID)
+	}
+	if run.SessionID != "" {
+		if active, ok := store.leases[run.SessionID]; ok {
+			activeRun, exists := store.runs[active.RunID]
+			if !exists {
+				return fmt.Errorf("%w: active run %s is missing", ErrSessionConflict, active.RunID)
+			}
+			if activeRun.ModelBindingID != run.ModelBindingID {
+				return fmt.Errorf("%w: active run %s", ErrModelBindingMismatch, active.RunID)
+			}
+			if err := store.validateStoredRunPendingApprovalAuthorityLocked(
+				activeRun, run.ModelBindingID, fmt.Sprintf("active run %s", active.RunID),
+			); err != nil {
+				return err
+			}
+		}
+	}
 	if existingRun.SkillSetID != run.SkillSetID {
 		return fmt.Errorf("%w: run %s", ErrSkillSetMismatch, run.ID)
 	}
@@ -376,19 +427,25 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 	run.CreatedAt = existingRun.CreatedAt
 	run.Input = existingRun.Input
 
+	if request.Session != nil && request.Session.ModelBindingID != run.ModelBindingID {
+		return fmt.Errorf("%w: session %s snapshot", ErrModelBindingMismatch, run.SessionID)
+	}
 	if run.Status == RunStatusInterrupted || run.Status == RunStatusCancelled {
 		request.Session = nil
 	}
 	if run.SessionID != "" {
 		existingSession, sessionExists := store.sessions[run.SessionID]
+		if sessionExists && existingSession.ModelBindingID != run.ModelBindingID {
+			return fmt.Errorf("%w: session %s", ErrModelBindingMismatch, run.SessionID)
+		}
 		if sessionExists && existingSession.SkillSetID != run.SkillSetID {
 			return fmt.Errorf("%w: session %s", ErrSkillSetMismatch, run.SessionID)
 		}
 		if sessionExists && existingSession.OperationSetID != "" && existingSession.OperationSetID != run.OperationSetID {
 			return fmt.Errorf("%w: session %s operation set", ErrOperationPlanChanged, run.SessionID)
 		}
-		if (run.SkillSetID != "" || run.OperationSetID != "") && !sessionExists {
-			return fmt.Errorf("%w: session %s has no immutable runtime binding", ErrSessionConflict, run.SessionID)
+		if !sessionExists {
+			return fmt.Errorf("%w: session %s has no immutable runtime binding", ErrSessionNotFound, run.SessionID)
 		}
 		if request.Session != nil && request.Session.SkillSetID != run.SkillSetID {
 			return fmt.Errorf("%w: session %s snapshot", ErrSkillSetMismatch, run.SessionID)
@@ -398,10 +455,21 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 		}
 	}
 
+	if err := store.validateStoredRunPendingApprovalAuthorityLocked(
+		existingRun, run.ModelBindingID, fmt.Sprintf("run %s durable approval", run.ID),
+	); err != nil {
+		return err
+	}
+
 	var approvalAudit *ItemRecord
 	var approvalCommit *PendingApprovalCommit
 	if request.PendingApproval != nil {
 		pending := request.PendingApproval
+		if err := validatePendingApprovalCommitAuthority(
+			*pending, run.ModelBindingID, fmt.Sprintf("run %s pending approval", run.ID),
+		); err != nil {
+			return err
+		}
 		if run.Status != RunStatusWaitingUser || !pending.Decision.Pending || pending.Decision.Approved ||
 			pending.Request.Operation.RunID != run.ID || pending.Request.Operation.SessionID != run.SessionID ||
 			pending.Audit.Type != ItemTypeApproval || pending.Audit.RunID != run.ID || pending.Audit.SessionID != run.SessionID {
@@ -423,7 +491,7 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 				committedRevision = session.Revision
 			}
 		}
-		if pending.Request.Checkpoint == nil || pending.Request.Checkpoint.ExpectedSessionRevision != committedRevision {
+		if pending.Request.Checkpoint.ExpectedSessionRevision != committedRevision {
 			return fmt.Errorf("%w: pending approval session revision does not match waiting commit", ErrRunStoreProtocol)
 		}
 		commit := *pending
@@ -440,7 +508,7 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 		if session, exists := store.sessions[run.SessionID]; run.SessionID != "" && exists {
 			currentRevision = session.Revision
 		}
-		if persisted.Request.Checkpoint == nil || persisted.Request.Checkpoint.ExpectedSessionRevision != currentRevision {
+		if persisted.Request.Checkpoint.ExpectedSessionRevision != currentRevision {
 			return fmt.Errorf("%w: waiting run %s approval session revision changed", ErrOperationPlanChanged, run.ID)
 		}
 	}
@@ -515,6 +583,42 @@ func (store *InMemoryStore) FinishRun(ctx context.Context, request FinishRunRequ
 }
 
 var _ RunStore = (*InMemoryStore)(nil)
+
+func (store *InMemoryStore) sessionHasStoredRunLocked(sessionID string) bool {
+	for _, run := range store.runs {
+		if run.SessionID == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func (store *InMemoryStore) validateStoredRunPendingApprovalAuthorityLocked(
+	run RunRecord,
+	modelBindingID string,
+	subject string,
+) error {
+	pending, exists := store.pendingApprovals[run.ID]
+	if run.PendingApprovalDigest == "" {
+		if exists {
+			return fmt.Errorf("%w: %s has approval authority without a run digest", ErrOperationPlanChanged, subject)
+		}
+		return nil
+	}
+	if err := validateApprovalAuthorityDigest(run.PendingApprovalDigest); err != nil {
+		return fmt.Errorf("%w: %s has an invalid run approval digest: %v", ErrOperationPlanChanged, subject, err)
+	}
+	if !exists {
+		return fmt.Errorf("%w: %s has no durable approval authority", ErrOperationPlanChanged, subject)
+	}
+	if err := validatePendingApprovalCommitAuthority(pending, modelBindingID, subject); err != nil {
+		return err
+	}
+	if pending.Digest != run.PendingApprovalDigest {
+		return fmt.Errorf("%w: %s approval digest does not match the run", ErrOperationPlanChanged, subject)
+	}
+	return nil
+}
 
 func samePersistentRunInput(left, right Input) (bool, error) {
 	leftDigest, err := persistentOperationInputDigest(left)

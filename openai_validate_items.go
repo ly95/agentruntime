@@ -20,12 +20,11 @@ func validateOpenAIStreamItem(item responses.ResponseOutputItemUnion, expectedSt
 	if err != nil {
 		return err
 	}
-	_ = expectedStatus
+	if err := validateOpenAIStreamItemStatus(item, fields, expectedStatus, eventType, label); err != nil {
+		return err
+	}
 	switch item.Type {
 	case "message":
-		if err := openAIRequireDomain(fields, "status", []string{"in_progress", "completed", "incomplete"}, label); err != nil {
-			return err
-		}
 		role, err := openAIStringField(fields, "role")
 		if err != nil {
 			return err
@@ -55,9 +54,6 @@ func validateOpenAIStreamItem(item responses.ResponseOutputItemUnion, expectedSt
 			}
 		}
 	case "reasoning":
-		if err := openAIRequireDomain(fields, "status", []string{"in_progress", "completed", "incomplete"}, label); err != nil {
-			return err
-		}
 		if !openAINonNullRaw(fields["summary"]) {
 			return fmt.Errorf("%w: OpenAI %s is missing its summary", ErrInvalidModelOutput, label)
 		}
@@ -93,9 +89,6 @@ func validateOpenAIStreamItem(item responses.ResponseOutputItemUnion, expectedSt
 			}
 		}
 	case "function_call":
-		if err := openAIRequireDomain(fields, "status", []string{"in_progress", "completed", "incomplete"}, label); err != nil {
-			return err
-		}
 		for _, name := range []string{"call_id", "name", "arguments"} {
 			raw, present := fields[name]
 			if !present || !openAINonNullRaw(raw) {
@@ -125,6 +118,72 @@ func validateOpenAIStreamItem(item responses.ResponseOutputItemUnion, expectedSt
 		return fmt.Errorf("%w: OpenAI %s has unsupported item type %q", ErrInvalidModelOutput, label, item.Type)
 	}
 	return nil
+}
+
+func validateOpenAIStreamItemStatus(
+	item responses.ResponseOutputItemUnion,
+	fields map[string]json.RawMessage,
+	expectedStatus responses.ResponseStatus,
+	eventType string,
+	label string,
+) error {
+	expected := string(expectedStatus)
+	if expected != "in_progress" && expected != "completed" {
+		return fmt.Errorf("%w: OpenAI %s has an unsupported expected lifecycle status", ErrInvalidModelOutput, label)
+	}
+
+	statusRequired := false
+	switch item.Type {
+	case "message":
+		statusRequired = true
+	case "reasoning", "function_call":
+	default:
+		return fmt.Errorf("%w: OpenAI %s has unsupported item type %q", ErrInvalidModelOutput, label, item.Type)
+	}
+
+	raw, present := fields["status"]
+	if !present {
+		if statusRequired {
+			return fmt.Errorf("%w: OpenAI %s is missing its status", ErrInvalidModelOutput, label)
+		}
+		return nil
+	}
+	if !openAINonNullRaw(raw) {
+		return fmt.Errorf("%w: OpenAI %s status must not be null", ErrInvalidModelOutput, label)
+	}
+	rawStatus, err := openAIRawString(raw, label+".status")
+	if err != nil {
+		return err
+	}
+
+	var sdkStatus string
+	var sdkStatusPresent bool
+	switch item.Type {
+	case "message":
+		message := item.AsMessage()
+		sdkStatus = string(message.Status)
+		sdkStatusPresent = message.JSON.Status.Valid()
+	case "reasoning":
+		reasoning := item.AsReasoning()
+		sdkStatus = string(reasoning.Status)
+		sdkStatusPresent = reasoning.JSON.Status.Valid()
+	case "function_call":
+		call := item.AsFunctionCall()
+		sdkStatus = string(call.Status)
+		sdkStatusPresent = call.JSON.Status.Valid()
+	}
+	if !sdkStatusPresent || sdkStatus != rawStatus {
+		return fmt.Errorf("%w: OpenAI %s status does not match its SDK item schema", ErrInvalidModelOutput, label)
+	}
+	if rawStatus == expected {
+		return nil
+	}
+	if expectedStatus == responses.ResponseStatusCompleted &&
+		eventType == "response.output_item.done" &&
+		rawStatus == string(responses.ResponseStatusIncomplete) {
+		return nil
+	}
+	return fmt.Errorf("%w: OpenAI %s status contradicts the stream item lifecycle", ErrInvalidModelOutput, label)
 }
 
 func validateOpenAIReasoningSummaryPart(raw json.RawMessage, label string) error {

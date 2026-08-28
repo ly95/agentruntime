@@ -409,6 +409,9 @@ type ApprovalRequest struct {
 // ApprovalCheckpoint is the immutable in-run state required to resume one
 // pending approval without replaying or renumbering earlier operation batches.
 type ApprovalCheckpoint struct {
+	// ModelBindingID binds adapter replay and approval authority to the exact
+	// durable BoundModel identity that produced the pending operation.
+	ModelBindingID          string
 	Transcript              []ModelInputItem
 	ContextCheckpoint       *ContextCheckpoint
 	SeenCallIDs             []string

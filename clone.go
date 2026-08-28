@@ -34,6 +34,14 @@ func appendModelOutputItems(transcript []ModelInputItem, items []ModelOutputItem
 	return transcript, nil
 }
 
+// ValidateModelOutputItem verifies that a provider-neutral output item has a
+// canonical adapter replay envelope whose type, identity, text, and function-call data
+// agree with its structured projection. Provider adapter conformance tests may
+// call this before exposing an item to Runtime.
+func ValidateModelOutputItem(item ModelOutputItem) error {
+	return validateModelOutputItem(item)
+}
+
 func validateModelOutputItem(item ModelOutputItem) error {
 	if err := validateUTF8Boundary("model output item", item); err != nil {
 		return err
@@ -205,6 +213,13 @@ func extractReplayMessageSemantics(object map[string]any) (replayMessageSemantic
 		return replayMessageSemantics{}, fmt.Errorf("message raw requires an exact content array or native text string")
 	}
 	return replayMessageSemantics{text: text, aggregate: true}, nil
+}
+
+// ValidateModelResponse verifies the complete replay contract for a response:
+// canonical response and item identities, replayable item envelopes, unique
+// provider item IDs, and exact aggregate output-text/refusal projection.
+func ValidateModelResponse(response *ModelResponse) error {
+	return validateModelResponseReplayIdentity(response)
 }
 
 func validateModelResponseReplayIdentity(response *ModelResponse) error {

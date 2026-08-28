@@ -45,6 +45,9 @@ func validateOpenAIStreamEventFields(event responses.ResponseStreamEventUnion) e
 				return err
 			}
 		}
+		if err := validateOpenAIResponseEventStatus(event.Type, event.Response.Status); err != nil {
+			return err
+		}
 	case "response.in_progress", "response.completed", "response.failed", "response.incomplete":
 		for _, check := range []struct {
 			valid bool
@@ -58,6 +61,9 @@ func validateOpenAIStreamEventFields(event responses.ResponseStreamEventUnion) e
 			if err := openAIStreamRequire(check.valid, event.Type, check.name); err != nil {
 				return err
 			}
+		}
+		if err := validateOpenAIResponseEventStatus(event.Type, event.Response.Status); err != nil {
+			return err
 		}
 	case "response.output_item.added", "response.output_item.done":
 		for _, check := range []struct {
@@ -299,6 +305,26 @@ func validateOpenAIStreamEventFields(event responses.ResponseStreamEventUnion) e
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func validateOpenAIResponseEventStatus(eventType string, status responses.ResponseStatus) error {
+	var expected string
+	switch eventType {
+	case "response.created", "response.in_progress":
+		expected = "in_progress"
+	case "response.completed":
+		expected = "completed"
+	case "response.failed":
+		expected = "failed"
+	case "response.incomplete":
+		expected = "incomplete"
+	default:
+		return nil
+	}
+	if string(status) != expected {
+		return fmt.Errorf("%w: OpenAI stream event %s response.status contradicts its event type", ErrInvalidModelOutput, eventType)
 	}
 	return nil
 }

@@ -12,14 +12,29 @@ import (
 	"github.com/openai/openai-go/v3/shared"
 )
 
+// OpenAIResponsesAdapterVersion identifies this adapter's provider mapping and
+// replay contract. A version change creates a new durable ModelBinding.
+const OpenAIResponsesAdapterVersion = "responses-v1"
+
+// OpenAIModelConfig configures the OpenAI Responses adapter and its immutable
+// provider binding. Model, EndpointClass, and CredentialPrincipal are required.
 type OpenAIModelConfig struct {
-	Model     shared.ResponsesModel
+	// Model is the exact caller-selected provider model. Responses that identify a
+	// different model are rejected rather than accepted as a substitution.
+	Model shared.ResponsesModel
+	// EndpointClass is a stable, non-secret deployment label, not an endpoint URL.
+	EndpointClass string
+	// CredentialPrincipal is a stable, non-secret account or service identity,
+	// not an API key or access token. Rotating its secret need not change this label.
+	CredentialPrincipal string
+	// Reasoning configures supported OpenAI reasoning parameters when non-nil.
 	Reasoning *shared.ReasoningParam
 }
 
 type OpenAIModel struct {
 	client    openai.Client
 	model     shared.ResponsesModel
+	binding   ModelBinding
 	reasoning *shared.ReasoningParam
 	toolMu    sync.RWMutex
 	toolCache map[string][]responses.ToolUnionParam
@@ -28,9 +43,22 @@ type OpenAIModel struct {
 // NewOpenAIModel constructs a Responses API model over client. The client owns
 // authentication, endpoint, middleware, timeout, and transport retry policy.
 func NewOpenAIModel(client openai.Client, cfg OpenAIModelConfig) (*OpenAIModel, error) {
-	cfg.Model = shared.ResponsesModel(strings.TrimSpace(string(cfg.Model)))
 	if cfg.Model == "" {
 		return nil, errors.New("agent: OpenAI model is required")
+	}
+	if string(cfg.Model) != strings.TrimSpace(string(cfg.Model)) {
+		return nil, errors.New("agent: OpenAI model must be canonical without surrounding whitespace")
+	}
+	if err := validateOpenAIBindingLabels(cfg.EndpointClass, cfg.CredentialPrincipal); err != nil {
+		return nil, err
+	}
+	binding := ModelBinding{
+		Provider: "openai", Model: string(cfg.Model),
+		EndpointClass: cfg.EndpointClass, CredentialPrincipal: cfg.CredentialPrincipal,
+		AdapterVersion: OpenAIResponsesAdapterVersion,
+	}
+	if err := binding.Validate(); err != nil {
+		return nil, fmt.Errorf("agent: invalid OpenAI model binding: %w", err)
 	}
 	var reasoning *shared.ReasoningParam
 	if cfg.Reasoning != nil {
@@ -57,9 +85,19 @@ func NewOpenAIModel(client openai.Client, cfg OpenAIModelConfig) (*OpenAIModel, 
 	return &OpenAIModel{
 		client:    client,
 		model:     cfg.Model,
+		binding:   binding,
 		reasoning: reasoning,
 		toolCache: make(map[string][]responses.ToolUnionParam),
 	}, nil
+}
+
+// Binding returns the immutable OpenAI provider, model, endpoint, principal,
+// and adapter-version identity used by durable Runtime sessions.
+func (m *OpenAIModel) Binding() ModelBinding {
+	if m == nil {
+		return ModelBinding{}
+	}
+	return m.binding
 }
 
 func (m *OpenAIModel) Complete(ctx context.Context, req ModelRequest) (*ModelResponse, error) {
@@ -71,18 +109,37 @@ func (m *OpenAIModel) Complete(ctx context.Context, req ModelRequest) (*ModelRes
 		return nil, err
 	}
 	stream := m.client.Responses.NewStreaming(ctx, params)
-	defer func() { _ = stream.Close() }()
-	state := newOpenAIStreamState(req.StreamSink)
+	state := newOpenAIStreamState(req.StreamSink, string(m.model))
 	for stream.Next() {
 		if err := state.accept(stream.Current()); err != nil {
-			return nil, err
+			state.protocolError = err
+			break
 		}
 	}
-	response, err := state.finish(stream.Err())
+	readErr := stream.Err()
+	closeErr := stream.Close()
+	streamErr := readErr
+	if streamErr == nil {
+		streamErr = closeErr
+	} else if closeErr != nil {
+		streamErr = errors.Join(streamErr, closeErr)
+	}
+	response, err := state.finish(streamErr)
 	if err != nil {
-		return nil, classifyOpenAIError(err)
+		return nil, err
 	}
 	return response, nil
+}
+
+func validateOpenAIBindingLabels(endpointClass, credentialPrincipal string) error {
+	if strings.Contains(strings.ToLower(endpointClass), "://") {
+		return errors.New("agent: OpenAI endpoint class must be a stable label, not an endpoint URL")
+	}
+	principal := strings.ToLower(strings.TrimSpace(credentialPrincipal))
+	if strings.HasPrefix(principal, "sk-") || strings.HasPrefix(principal, "bearer ") {
+		return errors.New("agent: OpenAI credential principal must be a stable identity label, not an API key or bearer token")
+	}
+	return nil
 }
 
 func (m *OpenAIModel) buildResponseParams(req ModelRequest) (responses.ResponseNewParams, error) {

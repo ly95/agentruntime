@@ -140,47 +140,56 @@ func TestRuntimeReturnsRefusalAsFinalOutput(t *testing.T) {
 	}
 }
 
-func TestRuntimeRetriesReasoningOnlyResponseOnceWithoutReasoning(t *testing.T) {
+func TestRuntimeRejectsReasoningOnlyResponseWithoutRetry(t *testing.T) {
 	model := &scriptedModel{responses: []*ModelResponse{
 		{ID: "resp-reasoning-only", FinishReason: "length", HadReasoning: true, Items: []ModelOutputItem{}},
-		messageResponse("resp-corrected", "final answer"),
-	}}
-	rt := newTestRuntime(t, model, nil, nil, nil, nil, nil, nil)
-
-	result, err := rt.Run(context.Background(), Input{User: "request"})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if result.Output != "final answer" {
-		t.Fatalf("output=%q", result.Output)
-	}
-	if len(model.requests) != 2 {
-		t.Fatalf("model requests=%d, want 2", len(model.requests))
-	}
-	if model.requests[0].DisableReasoning || !model.requests[1].DisableReasoning {
-		t.Fatalf("disable reasoning flags: first=%t second=%t", model.requests[0].DisableReasoning, model.requests[1].DisableReasoning)
-	}
-	if !strings.Contains(model.requests[1].Instructions, "never return reasoning alone") {
-		t.Fatalf("corrective instructions missing: %q", model.requests[1].Instructions)
-	}
-}
-
-func TestRuntimeDoesNotRetryReasoningOnlyResponseMoreThanOnce(t *testing.T) {
-	model := &scriptedModel{responses: []*ModelResponse{
-		{ID: "resp-reasoning-only-1", FinishReason: "length", HadReasoning: true, Items: []ModelOutputItem{}},
-		{ID: "resp-reasoning-only-2", FinishReason: "stop", HadReasoning: true, Items: []ModelOutputItem{}},
+		messageResponse("must-not-run", "unexpected retry"),
 	}}
 	rt := newTestRuntime(t, model, nil, nil, nil, nil, nil, nil)
 
 	_, err := rt.Run(context.Background(), Input{User: "request"})
+	if !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), `finish_reason="length"`) {
+		t.Fatalf("Run error=%v, want reasoning-only ErrInvalidModelOutput", err)
+	}
+	if len(model.requests) != 1 || len(model.responses) != 1 {
+		t.Fatalf("model requests=%d remaining responses=%d, want one call and no retry", len(model.requests), len(model.responses))
+	}
+	if model.requests[0].DisableReasoning || strings.Contains(model.requests[0].Instructions, "never return reasoning alone") {
+		t.Fatalf("Runtime synthesized corrective request options: %+v", model.requests[0])
+	}
+}
+
+func TestRuntimeReasoningOnlyFailureDoesNotAdvanceDurableTranscript(t *testing.T) {
+	model := &scriptedModel{responses: []*ModelResponse{{
+		ID: "resp-durable-reasoning-only", FinishReason: "stop", HadReasoning: true, Items: []ModelOutputItem{},
+	}}}
+	store := &recordingStore{}
+	rt := newTestRuntime(t, model, nil, nil, nil, nil, nil, store)
+
+	_, err := rt.Run(context.Background(), Input{User: "request", SessionID: "reasoning-only-session"})
 	if !errors.Is(err, ErrInvalidModelOutput) {
 		t.Fatalf("Run error=%v, want ErrInvalidModelOutput", err)
 	}
-	if len(model.requests) != 2 {
-		t.Fatalf("model requests=%d, want exactly 2", len(model.requests))
+	if len(model.requests) != 1 {
+		t.Fatalf("model requests=%d, want exactly one", len(model.requests))
 	}
-	if !strings.Contains(err.Error(), `finish_reason="stop"`) {
-		t.Fatalf("error missing final finish reason: %v", err)
+	store.mu.Lock()
+	session := store.sessions["reasoning-only-session"]
+	responseAudits := 0
+	for _, item := range store.items {
+		if item.Type == ItemTypeModelResponse {
+			responseAudits++
+		}
+	}
+	store.mu.Unlock()
+	if session.LastResponseID != "" || len(session.Transcript) != 0 {
+		t.Fatalf("durable transcript advanced after invalid response: %+v", session)
+	}
+	if session.Revision != 1 || session.LastRunID == "" || !strings.Contains(session.LastError, ErrInvalidModelOutput.Error()) {
+		t.Fatalf("durable failure metadata was not committed: %+v", session)
+	}
+	if responseAudits != 1 {
+		t.Fatalf("model response audits=%d, want one accepted response audit", responseAudits)
 	}
 }
 

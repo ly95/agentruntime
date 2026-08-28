@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -55,8 +56,9 @@ func TestLocalSourceAcceptsEmptyFileAtExactSkillByteLimit(t *testing.T) {
 
 func TestLocalSourceResolveRejectsNilContext(t *testing.T) {
 	source := NewLocalSource(LocalSourceConfig{ID: "local"})
-	//lint:ignore SA1012 This test verifies that LocalSource rejects a nil context explicitly.
-	if artifacts, err := source.Resolve(nil); err == nil || artifacts != nil || !errors.Is(err, ErrInvalidSource) {
+	var nilContext context.Context
+	artifacts, err := source.Resolve(nilContext)
+	if err == nil || artifacts != nil || !errors.Is(err, ErrInvalidSource) {
 		t.Fatalf("artifacts=%v error=%v", artifacts, err)
 	}
 }

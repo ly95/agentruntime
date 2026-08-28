@@ -298,7 +298,7 @@ func TestPersistedTranscriptRejectsTransientOrUnstableImageAttachments(t *testin
 
 func TestRuntimeRefreshesHistoricalImageForEveryProviderCall(t *testing.T) {
 	model := &scriptedModel{responses: []*ModelResponse{
-		{ID: "resp-reasoning-only", FinishReason: "length", HadReasoning: true, Items: []ModelOutputItem{}},
+		callResponse("resp-refresh-tool", ToolCall{ID: "call-refresh", Name: "read_context", Input: json.RawMessage(`{}`)}),
 		messageResponse("resp-final", "done"),
 	}}
 	store := &recordingStore{}
@@ -316,10 +316,15 @@ func TestRuntimeRefreshesHistoricalImageForEveryProviderCall(t *testing.T) {
 		attachment.URL = fmt.Sprintf("https://cdn.example.com/fresh-%d.png", resolveCalls)
 		return attachment, nil
 	})
-	rt, err := NewRuntime(RuntimeConfig{Model: model, RunStore: store})
-	if err != nil {
+	operations := NewOperationRegistry()
+	if err := operations.Register(operation("read_context", OperationEffectRead)); err != nil {
 		t.Fatal(err)
 	}
+	rt := newTestRuntime(t, model, operations, allowPolicy(), OperationExecutorFunc(
+		func(context.Context, OperationRequest) (OperationResult, error) {
+			return OperationResult{Output: json.RawMessage(`{}`)}, nil
+		},
+	), nil, nil, store)
 	if _, err := rt.Run(t.Context(), Input{User: "continue", SessionID: "session-refresh", ImageAttachmentResolver: resolver}); err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +335,7 @@ func TestRuntimeRefreshesHistoricalImageForEveryProviderCall(t *testing.T) {
 		t.Fatalf("first URL=%q", got)
 	}
 	if got := model.requests[1].Input[0].Attachments[0].URL; got != "https://cdn.example.com/fresh-2.png" {
-		t.Fatalf("retry URL=%q", got)
+		t.Fatalf("second provider call URL=%q", got)
 	}
 	store.mu.Lock()
 	persisted := store.sessions["session-refresh"].Transcript[0].Attachments[0]

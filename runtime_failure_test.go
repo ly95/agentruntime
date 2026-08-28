@@ -386,7 +386,7 @@ func TestRunStoreRejectsGeneratedCreateCollisionWithWaitingRun(t *testing.T) {
 		t.Fatalf("second model requests=%d, want zero", len(secondModel.requests))
 	}
 	if legacyAdapter.legacyCalls != 0 {
-		t.Fatalf("legacy BeginRunV2 override calls=%d, want zero because RunStore requires split V3 methods", legacyAdapter.legacyCalls)
+		t.Fatalf("legacy BeginRunV2 override calls=%d, want zero because RunStore requires split V4 methods", legacyAdapter.legacyCalls)
 	}
 }
 

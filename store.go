@@ -35,8 +35,11 @@ const (
 )
 
 type RunRecord struct {
-	ID             string
-	SessionID      string
+	ID        string
+	SessionID string
+	// ModelBindingID is the versioned digest of the immutable BoundModel identity.
+	// Durable records store this ID, never endpoint or credential-principal text.
+	ModelBindingID string `json:"ModelBindingID,omitempty"`
 	SkillSetID     string `json:"SkillSetID,omitempty"`
 	OperationSetID string `json:"OperationSetID,omitempty"`
 	// PendingApprovalDigest binds a waiting run to the exact immutable approval
@@ -82,7 +85,10 @@ type ItemRecord struct {
 }
 
 type SessionState struct {
-	ID             string
+	ID string
+	// ModelBindingID permanently binds this session to one versioned model adapter
+	// identity. An empty legacy value is not inferred or upgraded by RunStore V4.
+	ModelBindingID string `json:"ModelBindingID,omitempty"`
 	SkillSetID     string `json:"SkillSetID,omitempty"`
 	OperationSetID string `json:"OperationSetID,omitempty"`
 	Revision       uint64
@@ -96,8 +102,8 @@ type SessionState struct {
 	UpdatedAt      time.Time
 }
 
-// RunHandle proves ownership of the session lease acquired by CreateRunV3 or
-// ResumeRunV3.
+// RunHandle proves ownership of the session lease acquired by CreateRunV4 or
+// ResumeRunV4.
 // The store, not Runtime, owns lease recovery for abandoned runs.
 type RunHandle struct {
 	RunID           string
@@ -114,7 +120,7 @@ type CreateRunRequest struct {
 	LeaseTTL time.Duration
 }
 
-// Validate checks the context-free CreateRunV3 request contract. Store
+// Validate checks the context-free CreateRunV4 request contract. Store
 // implementations should call it before opening a transaction; Runtime calls
 // it before invoking the store as an additional fail-explicit boundary.
 func (request CreateRunRequest) Validate() error {
@@ -136,7 +142,7 @@ type ResumeRunRequest struct {
 	InputDigest string
 }
 
-// Validate checks the context-free ResumeRunV3 request contract.
+// Validate checks the context-free ResumeRunV4 request contract.
 func (request ResumeRunRequest) Validate() error {
 	if err := validateRunStartRequest(request.Run, request.LeaseID, request.LeaseTTL); err != nil {
 		return fmt.Errorf("%w: resume run: %v", ErrRunStoreProtocol, err)
@@ -155,6 +161,9 @@ func validateRunStartRequest(run RunRecord, leaseID string, leaseTTL time.Durati
 		return err
 	}
 	if err := requireCanonicalIdentity(run.ID, "run id"); err != nil {
+		return err
+	}
+	if err := requireCanonicalIdentity(run.ModelBindingID, "model binding id"); err != nil {
 		return err
 	}
 	if run.SessionID != "" {
@@ -196,7 +205,7 @@ type ResumedRun struct {
 	PendingApprovalDigest string
 	// PendingApproval is the complete immutable authority atomically associated
 	// with PendingApprovalDigest. Runtime recomputes and validates this payload
-	// while the ResumeRunV3 transaction is still abortable.
+	// while the ResumeRunV4 transaction is still abortable.
 	PendingApproval *PendingApprovalCommit
 }
 
@@ -204,7 +213,7 @@ type ResumedRun struct {
 // computed the exact post-commit handle/session view and before it mutates any
 // run, approval, session, lease, or identity state. A non-nil error aborts the
 // transaction without mutation. The callback must be invoked exactly once on a
-// successful CreateRunV3 or ResumeRunV3 call.
+// successful CreateRunV4 or ResumeRunV4 call.
 type AcceptRunStart func(RunStart) error
 
 // AcceptResumedRun has the same pre-commit semantics for a waiting-run resume.
@@ -229,6 +238,9 @@ func (request FinishRunRequest) Validate() error {
 	}
 	run := request.Run
 	if err := requireCanonicalIdentity(run.ID, "run id"); err != nil {
+		return fmt.Errorf("%w: finish run: %v", ErrRunStoreProtocol, err)
+	}
+	if err := requireCanonicalIdentity(run.ModelBindingID, "model binding id"); err != nil {
 		return fmt.Errorf("%w: finish run: %v", ErrRunStoreProtocol, err)
 	}
 	switch run.Status {
@@ -311,9 +323,10 @@ func (request FinishRunRequest) Validate() error {
 // pending approval and append Audit atomically with the waiting_user Run
 // transition; an error must leave none of those mutations visible.
 type PendingApprovalCommit struct {
-	// AuthorityVersion identifies the complete authority schema. Version zero
-	// is the pre-versioned subset digest and is intentionally not resumable:
-	// omitted request/audit fields cannot be proven after restart.
+	// AuthorityVersion identifies the complete authority schema and must equal
+	// PendingApprovalAuthorityVersion. Version zero, version 1, and every other
+	// non-current schema are intentionally not resumable: omitted authority fields
+	// cannot be proven after restart.
 	AuthorityVersion uint32
 	Request          ApprovalRequest
 	Decision         ApprovalDecision
@@ -336,27 +349,35 @@ type SessionLeaseFence struct {
 }
 
 // RunStore owns the transaction boundary for a run and its session.
-// CreateRunV3 atomically creates a previously absent running run and acquires
+// CreateRunV4 atomically creates a previously absent running run and acquires
 // the session lease. It rejects every existing Run.ID, including waiting runs.
-// ResumeRunV3 atomically resumes only the exact waiting Run.ID and returns
+// ResumeRunV4 atomically resumes only the exact waiting Run.ID and returns
 // ErrRunNotFound without mutation when no RunRecord owns that ID. Runtime uses
 // that read-only absence result to create an explicitly host-selected ID; a
-// generated ID is sent only to CreateRunV3.
-// For a new session with a non-empty Run.SkillSetID or Run.OperationSetID,
-// CreateRunV3 must also create and return a binding-only SessionState at revision
-// zero. Those bindings are independent of transcript readiness and must survive
-// nil-Session terminal writes and abandoned-lease recovery. Before changing a
-// stored session, resuming a waiting run, or fencing an active run, stores must
-// compare both immutable bindings with every applicable SessionState and
-// RunRecord. A SkillSet mismatch returns ErrSkillSetMismatch; an operation-set
+// generated ID is sent only to CreateRunV4.
+// Every create and resume carries a canonical non-empty Run.ModelBindingID. For
+// every new stateful session, CreateRunV4 must also create and return a
+// binding-only SessionState at revision zero. The model binding is immutable:
+// before changing a stored session, resuming a waiting run, or fencing an active
+// run, stores must compare it with every applicable RunRecord, SessionState, and
+// waiting approval checkpoint. Every applicable durable pending approval must
+// use PendingApprovalAuthorityVersion and have a non-nil checkpoint; a version
+// mismatch or absence returns ErrOperationPlanChanged. Any model binding
+// difference, including an empty legacy binding, returns
+// ErrModelBindingMismatch without mutation or callback invocation; stores must
+// never upgrade an empty model binding implicitly.
+// Skill-set and operation-set bindings are also independent of transcript
+// readiness and must survive nil-Session terminal writes and abandoned-lease
+// recovery. A SkillSet mismatch returns ErrSkillSetMismatch; an operation-set
 // mismatch returns ErrOperationPlanChanged. When resuming a waiting approval,
-// ResumeRunV3 must also compare InputDigest with the atomically stored approval
+// ResumeRunV4 must also compare InputDigest with the atomically stored approval
 // checkpoint before changing the run or acquiring a lease. A waiting run with
 // no non-empty PendingApprovalDigest or no exactly matching durable approval is
-// invalid and must be rejected before any mutation. Neither mismatch may mutate
-// state or acquire or fence a lease. A legacy record can have an empty
-// binding; Runtime upgrades it only on a successful write-free completion,
-// never while polling, pausing for approval, or rolling back a failure.
+// invalid and must be rejected before any mutation. No binding or input mismatch
+// may mutate state or acquire or fence a lease. A legacy record can have an
+// empty operation-set binding; Runtime upgrades it only on a successful
+// write-free completion, never while polling, pausing for approval, or rolling
+// back a failure.
 // Stores must permit a new run to fence an expired lease, assign a monotonically
 // increasing lease generation, and return the store-owned deadline in the handle.
 // RenewRunLease extends only a live matching generation. ValidateRunLease lets
@@ -368,27 +389,34 @@ type SessionLeaseFence struct {
 // renewal remains active while FinishRun executes, so stores must validate the
 // live owner fields and deadline; the request handle's observed LeaseDeadline
 // may lag a renewal.
-// A stateless finish must not carry lease or session authority. A supplied
-// Session must identify the finishing run through ID and LastRunID, advance the
-// handle revision exactly once, retain a non-zero existing CreatedAt, and never
-// move UpdatedAt backward. Waiting and completed runs carry no error payload;
+// A stateless finish must not carry lease or session authority. Every supplied
+// or durable PendingApprovalCommit must use PendingApprovalAuthorityVersion and
+// contain a checkpoint; a version mismatch or missing checkpoint returns
+// ErrOperationPlanChanged. A supplied Session and every supplied or durable
+// pending approval checkpoint must retain the finishing Run.ModelBindingID
+// exactly. A supplied Session must also identify
+// the finishing run through ID and LastRunID, advance the handle revision exactly
+// once, retain a non-zero existing CreatedAt, and never move UpdatedAt backward.
+// Waiting and completed runs carry no error payload;
 // failed, interrupted, and cancelled runs carry a non-empty error code and
 // message and no successful Result.
-// Run.CreatedAt and persistent Run.Input are immutable after CreateRunV3.
-// ResumeRunV3 and FinishRun must retain them rather than replacing them with a
+// Run.CreatedAt and persistent Run.Input are immutable after CreateRunV4.
+// ResumeRunV4 and FinishRun must retain them rather than replacing them with a
 // caller's current-run values, and neither may move Run.UpdatedAt backward.
 // When PendingApproval is supplied, FinishRun must also atomically persist that
 // complete approval record, its Digest, and its audit item. The approval
 // checkpoint's ExpectedSessionRevision must equal the session revision committed
 // by that same transaction, or the unchanged current revision when Session is
 // nil. Before mutating a waiting run, acquiring its lease, or fencing another
-// owner, a later ResumeRunV3 must compare the current session revision with that
+// owner, a later ResumeRunV4 must compare the current session revision with that
 // expected revision and fail on mismatch. It then returns the approval digest
 // and a complete cloned PendingApprovalCommit before Runtime accepts
-// ApprovalResumer output. AuthorityVersion 1 hashes the complete persistent
+// ApprovalResumer output. ResumeRunV4 must reject any durable authority whose
+// AuthorityVersion differs from PendingApprovalAuthorityVersion before invoking
+// the callback. PendingApprovalAuthorityVersion hashes the complete persistent
 // request, decision, audit, normalized arguments, operation summary, input
-// identity, checkpoint, and replay. Version zero and other pre-versioned subset
-// digests are not resumable because their omitted fields cannot be proved.
+// identity, checkpoint, and replay. Version zero, version 1, and every other
+// non-current authority are not resumable because omitted fields cannot be proved.
 // Runtime recomputes the complete authority and binds it to the proposed session
 // inside the abortable callback; a digest-only acknowledgement is invalid. Pure pending polls retain the
 // same authority and must not write a new Session snapshot or advance its
@@ -398,11 +426,11 @@ type SessionLeaseFence struct {
 // passes a nil Session while polling or pausing for approval; the store must
 // preserve the exact existing snapshot. A failed run whose session could not be
 // validated may do the same. A non-nil Session must retain the binding
-// established by CreateRunV3 or ResumeRunV3.
-// Run.ID and every ItemRecord.ID share one durable identity namespace. CreateRunV3,
+// established by CreateRunV4 or ResumeRunV4.
+// Run.ID and every ItemRecord.ID share one durable identity namespace. CreateRunV4,
 // AppendItem, and a FinishRun carrying PendingApproval must atomically reject an
 // identity already assigned to another run or item with ErrIdentityConflict and
-// leave no mutation visible. CreateRunV3 and ResumeRunV3 are distinct so an
+// leave no mutation visible. CreateRunV4 and ResumeRunV4 are distinct so an
 // adapter cannot lose create-versus-resume intent by rewriting a request bit.
 // Both methods must invoke their acceptance callback with the exact proposed
 // result while the transaction is still abortable; callback rejection leaves
@@ -412,13 +440,14 @@ type SessionLeaseFence struct {
 // check ctx and lease expiry again after callback acceptance and immediately
 // before commit. The proposed state contains the exact requested LeaseID, a
 // store-owned deadline live at callback completion, no session/lease authority
-// for stateless runs, and complete approval authority for resume. The V3 method names
-// intentionally fence older implementations until they adopt both split
-// authority paths and the pre-commit acceptance protocol. An error from either
+// for stateless runs, and complete approval authority for resume. The V4 method
+// names intentionally fence older implementations until they adopt model
+// binding authority in addition to both split authority paths and the pre-commit
+// acceptance protocol. An error from either
 // method must leave no mutation.
 type RunStore interface {
-	CreateRunV3(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error
-	ResumeRunV3(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error
+	CreateRunV4(ctx context.Context, request CreateRunRequest, accept AcceptRunStart) error
+	ResumeRunV4(ctx context.Context, request ResumeRunRequest, accept AcceptResumedRun) error
 	RenewRunLease(ctx context.Context, request RenewRunLeaseRequest) (RunHandle, error)
 	ValidateRunLease(ctx context.Context, handle RunHandle) (RunHandle, error)
 	AppendItem(ctx context.Context, item ItemRecord) error
