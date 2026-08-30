@@ -187,7 +187,7 @@ func TestOpenAIModelRejectsTerminalFailureAuthority(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(test.build()...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(test.build()...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 				t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
 			}
@@ -266,7 +266,7 @@ func TestOpenAIStreamTerminalProviderErrorClassification(t *testing.T) {
 				})
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || err == nil || !errors.Is(err, test.sentinel) {
 				t.Fatalf("Complete response=%+v error=%v, want %v", response, err, test.sentinel)
 			}
@@ -322,7 +322,7 @@ func TestOpenAIStreamRejectsEventAfterProviderTerminalAsProtocolError(t *testing
 		},
 	}
 
-	response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+	response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 	if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 		t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
 	}
@@ -376,7 +376,7 @@ func TestOpenAIStreamOutputItemStatusMatchesLifecycle(t *testing.T) {
 					sequence,
 				))
 
-				response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+				response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 				if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 					t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
 				}
@@ -433,7 +433,7 @@ func TestOpenAIStreamAcceptsOptionalReasoningAndFunctionStatuses(t *testing.T) {
 					map[string]any{"type": "response.completed", "sequence_number": sequence + 1, "response": completed},
 				)
 
-				response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+				response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 				if err != nil || response == nil || response.ID != "resp_optional_status" || len(response.Items) != 1 {
 					t.Fatalf("Complete response=%+v error=%v", response, err)
 				}
@@ -485,7 +485,7 @@ func TestOpenAIStreamIncompleteItemDoneReachesTerminalIncomplete(t *testing.T) {
 				{"type": "response.incomplete", "sequence_number": int64(3), "response": terminal},
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 				t.Fatalf("Complete response=%+v error=%v, want terminal incomplete ErrInvalidModelOutput", response, err)
 			}
@@ -527,7 +527,7 @@ func TestOpenAICompletedResponseRejectsDoneStatusMismatch(t *testing.T) {
 				{"type": "response.completed", "sequence_number": int64(3), "response": completed},
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 				t.Fatalf("Complete response=%+v error=%v, want status mismatch ErrInvalidModelOutput", response, err)
 			}
@@ -556,7 +556,7 @@ func TestOpenAICompletedResponseRejectsContradictoryItemStatus(t *testing.T) {
 				{"type": "response.completed", "sequence_number": int64(3), "response": completed},
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) {
 				t.Fatalf("Complete response=%+v error=%v, want ErrInvalidModelOutput", response, err)
 			}
@@ -582,7 +582,7 @@ func TestOpenAICompletedResponseRejectsUnfinishedAddedItem(t *testing.T) {
 		{"type": "response.completed", "sequence_number": int64(2), "response": completed},
 	}
 
-	response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+	response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 	if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "unfinished") {
 		t.Fatalf("Complete response=%+v error=%v, want unfinished-item ErrInvalidModelOutput", response, err)
 	}
@@ -603,7 +603,7 @@ func TestOpenAIResponseEnvelopeRejectsOmittedImmutableFields(t *testing.T) {
 				{"type": "response.completed", "sequence_number": int64(1), "response": completed},
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "omitted immutable response field") {
 				t.Fatalf("Complete response=%+v error=%v, want omitted immutable field failure", response, err)
 			}
@@ -670,7 +670,7 @@ func TestOpenAIStreamRejectsTextEvidenceAfterTerminalSubevent(t *testing.T) {
 				{"type": "response.completed", "sequence_number": int64(5), "response": completed},
 			}
 
-			response, err, chunks := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
+			response, chunks, err := completeOpenAIEventsTestStream(t, openAIEventsTestSSE(events...))
 			if response != nil || !errors.Is(err, ErrInvalidModelOutput) || !strings.Contains(err.Error(), "after text done") {
 				t.Fatalf("Complete response=%+v error=%v, want closed text lifecycle failure", response, err)
 			}
@@ -683,7 +683,7 @@ func TestOpenAIStreamRejectsTextEvidenceAfterTerminalSubevent(t *testing.T) {
 	}
 }
 
-func completeOpenAIEventsTestStream(t *testing.T, payload string) (*ModelResponse, error, []ModelStreamEvent) {
+func completeOpenAIEventsTestStream(t *testing.T, payload string) (*ModelResponse, []ModelStreamEvent, error) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -700,7 +700,7 @@ func completeOpenAIEventsTestStream(t *testing.T, payload string) (*ModelRespons
 		Input:        []ModelInputItem{{Type: ModelInputUserMessage, Text: "hello"}},
 		StreamSink:   func(event ModelStreamEvent) { chunks = append(chunks, event) },
 	})
-	return response, completeErr, chunks
+	return response, chunks, completeErr
 }
 
 func openAIEventsTestSSE(events ...map[string]any) string {
