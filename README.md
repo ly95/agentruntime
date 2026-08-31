@@ -6,6 +6,11 @@
 
 > **Status:** `agentruntime` is pre-1.0. The public API may change between minor
 > versions while the runtime contracts are refined.
+>
+> **Documentation target:** this README describes unreleased `main`. The latest
+> tag is `v0.1.0`, whose API is not compatible with all examples below. Use the
+> [v0.1.0 README](https://github.com/ly95/agentruntime/tree/v0.1.0#readme) with
+> the tagged module, or install `@main` to evaluate the current documentation.
 
 `agentruntime` is an embeddable Go **kernel** for agents built on the OpenAI
 Responses API. It owns the model/tool loop. The host keeps authorization,
@@ -90,9 +95,20 @@ transition acknowledgements, and reconciliation.
 
 ## Install
 
+For the tagged `v0.1.0` API, use its matching documentation:
+
 ```bash
-go get github.com/ly95/agentruntime@latest
+go get github.com/ly95/agentruntime@v0.1.0
 ```
+
+To evaluate the unreleased API documented by this README:
+
+```bash
+go get github.com/ly95/agentruntime@main
+```
+
+`@latest` currently resolves to `v0.1.0`; do not combine it with this branch's
+quick start. No `v0.2.0` release has been published.
 
 The module requires Go 1.26 or newer.
 
@@ -323,6 +339,7 @@ above.
 
 - [Host integration and approval resume](docs/host-integration-guide.md)
 - [Store adapter contract and conformance suites](docs/store-adapter-guide.md)
+- [Safety guarantees, non-guarantees, and failure windows](docs/safety-guarantees.md)
 - [Operation JSON Schema and argument decoding](docs/operation-schema-guide.md)
 - [Write and terminal-operation execution](docs/write-terminal-executor-guide.md)
 - [Context-window defaults and tuning](docs/context-window.md)
@@ -372,8 +389,11 @@ issue.
 ## Releases, support, and roadmap
 
 The source contract version is exposed as `agentruntime.Version`; Git tags use
-the same semantic version with a leading `v`. Release notes and the checked-in
-public API baseline are gated in CI before a tag is published.
+the same semantic version with a leading `v`. `api/v0.1.0.txt` records the tagged
+release API. The separate `api/main.txt` records the explicitly reviewed,
+unreleased API on `main`; CI fails on any addition, removal, or incompatible
+change until that baseline is deliberately regenerated and reviewed. Updating
+the `main` baseline does not publish or imply a new release.
 
 - [Changelog](CHANGELOG.md)
 - [Support policy](SUPPORT.md)

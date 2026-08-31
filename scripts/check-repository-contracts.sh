@@ -10,6 +10,10 @@ test -f "api/v${source_version}.txt"
 test -f "docs/releases/v${source_version}.md"
 grep -Fq "## [${source_version}]" CHANGELOG.md
 grep -Fq "[v${source_version} release notes](docs/releases/v${source_version}.md)" README.md
+grep -Fq 'bash scripts/check-api-baseline-contracts.sh' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # GitHub evaluates this expression, not Bash.
+grep -Fq 'API_BASELINE: "api/${{ github.ref_name }}.txt"' .github/workflows/release.yml
+test "$(grep -Fc 'run: bash scripts/check-api-baseline.sh' .github/workflows/release.yml)" -eq 2
 
 if git grep -n -E 'github\.com/ly95/agent-go|label: .*agent-go' -- . ':!.codegraph' ':!.codex-tmp' ':!scripts/check-repository-contracts.sh'; then
   echo 'repository contract check: stale agent-go repository identity found' >&2

@@ -64,6 +64,27 @@ Small, reviewable pull requests are preferred. Breaking API changes are
 possible before v1.0, but they still require a clear motivation and migration
 notes.
 
+## Public API baseline
+
+Run the same public API gate as CI from the repository root:
+
+```bash
+bash scripts/check-api-baseline.sh
+```
+
+If a public API change is intentional, document its compatibility impact and
+then regenerate the reviewed `main` snapshot with the repository-pinned tool:
+
+```bash
+GOTOOLCHAIN=go1.26.0 bash scripts/check-api-baseline.sh --write
+bash scripts/check-api-baseline.sh
+```
+
+Review the gate's reported API changes and the corresponding source diff before
+regenerating, then commit the binary `api/main.txt` snapshot with that source
+change. Do not rewrite a tagged release snapshot such as `api/v0.1.0.txt`;
+those files are immutable release evidence.
+
 ## Security reports
 
 Do not disclose suspected vulnerabilities in a public issue. Follow
